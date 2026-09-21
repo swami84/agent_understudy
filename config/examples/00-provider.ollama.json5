@@ -1,0 +1,34 @@
+// Local models via Ollama. No API key, no data leaves the machine.
+//
+// IMPORTANT: baseUrl points at the no-think proxy on :11435, not Ollama's
+// :11434. OpenClaw never sends `think: false`, so a reasoning model (Qwen3,
+// DeepSeek-R1, …) returns its chain-of-thought as ordinary message content —
+// which then gets delivered into your chat. The proxy injects the flag.
+// Start it with: systemctl --user enable --now ollama-nothink.service
+//
+// Build the model with a pinned context first (see ollama/README.md):
+//   ollama create qwen3-24k -f ollama/Modelfile.qwen27b-24k
+{
+  models: {
+    providers: {
+      ollama: {
+        api: "ollama",                        // native API — NOT the /v1 OpenAI shim
+        baseUrl: "http://127.0.0.1:11435",    // no-think proxy -> 11434
+        apiKey: "ollama-local",               // accepted marker for loopback hosts
+        models: [
+          {
+            id: "qwen3-24k",                  // must match your `ollama create` name
+            name: "Qwen3 (24k)",
+            input: ["text"],
+            contextTokens: 24576,             // must exceed your system prompt (~8k) with room for history
+            maxTokens: 1800,                  // cap output so replies can't truncate mid-sentence
+            params: {
+              keep_alive: "5m",               // "-1" keeps it resident; use a finite value if you share the GPU
+            },
+          },
+        ],
+      },
+    },
+  },
+  agents: { defaults: { model: { primary: "ollama/qwen3-24k" } } },
+}

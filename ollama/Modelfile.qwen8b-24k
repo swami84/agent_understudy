@@ -1,0 +1,4 @@
+# 8B with a 24k context. Faster and lighter than the 27B, but noticeably worse
+# at following instructions — the guard layer catches more with this model.
+FROM qwen3:8b
+PARAMETER num_ctx 24576

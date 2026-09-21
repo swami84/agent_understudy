@@ -1,0 +1,5 @@
+# 27B-class reasoning model with a 24k context.
+# Reasoning suppression is handled by proxy/ollama_nothink.py, not here —
+# `PARAMETER think false` is not a valid Modelfile parameter.
+FROM qwen3.8:27b
+PARAMETER num_ctx 24576

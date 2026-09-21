@@ -1,0 +1,38 @@
+// Safety settings. Every value here exists because its absence caused a real
+// incident — see guard/README.md. `python3 guard/invariants.py` enforces them.
+{
+  messages: {
+    groupChat: {
+      // How the assistant is summoned in a group. Must NOT match the bot's own
+      // output or it replies to itself in a loop. The lookahead excludes the
+      // attribution prefix ("🤖 Assistant: ...") including an emoji.
+      // Never put a literal emoji IN the pattern — OpenClaw's safe-regex check
+      // rejects the whole pattern silently and nothing can summon it.
+      mentionPatterns: ["^(?!\\W{0,4}\\s*assistant\\s*:).*\\bassistant\\b"],
+
+      // Unmentioned group chatter becomes quiet context, never a reply.
+      unmentionedInbound: "room_event",
+      historyLimit: 12,
+    },
+    // Batch rapid-fire messages into one turn instead of answering each.
+    queue: { byChannel: { whatsapp: "collect" } },
+  },
+
+  agents: {
+    defaults: {
+      // Deliver one complete message per reply. On, this splits a single reply
+      // into several chat messages as it generates — including any half-formed
+      // reasoning the model emits before reaching its answer.
+      blockStreamingDefault: "off",
+      blockStreamingBreak: "message_end",
+      thinkingDefault: "off",
+
+      // A scheduled "heartbeat" ships enabled and DMs you every 30 minutes.
+      // It is a cron job, not a config toggle — this is how you silence it.
+      heartbeat: { every: "8760h", directPolicy: "block" },
+    },
+  },
+
+  // Detect and back off repetitive tool-call loops. Defaults to FALSE.
+  tools: { loopDetection: { enabled: true } },
+}

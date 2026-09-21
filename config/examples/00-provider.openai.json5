@@ -1,0 +1,27 @@
+// OpenAI-compatible API.
+//
+//   export OPENAI_API_KEY=sk-...
+//
+// Also works with any OpenAI-compatible endpoint (vLLM, LM Studio, OpenRouter,
+// Together, …) by changing baseUrl. Check the provider's current model list —
+// model names change often and this file does not track them.
+{
+  models: {
+    providers: {
+      openai: {
+        apiKey: { source: "env", provider: "openai", id: "OPENAI_API_KEY" },
+        // baseUrl: "https://api.openai.com/v1",   // override for a compatible endpoint
+        models: [
+          {
+            id: "gpt-5",                 // <- confirm against your provider's model list
+            name: "GPT-5",
+            input: ["text", "image"],
+            contextTokens: 200000,
+            maxTokens: 2000,
+          },
+        ],
+      },
+    },
+  },
+  agents: { defaults: { model: { primary: "openai/gpt-5" } } },
+}

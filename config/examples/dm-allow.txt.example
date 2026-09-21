@@ -1,0 +1,3 @@
+# One phone number per line — people who may DM the assistant.
+# Any format works (+1 555-123-4567 / 15551234567); it normalizes to digits.
+# Your own number is added automatically by ingest/import_contacts.py.

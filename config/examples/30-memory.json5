@@ -1,0 +1,39 @@
+// Memory: markdown files on disk, indexed into SQLite FTS5 + sqlite-vec.
+// No external vector database.
+//
+// Changing provider/model/sources/tokenizer invalidates the index; rebuild with
+//   openclaw memory index --force --agent main
+{
+  memory: {
+    search: {
+      enabled: true,
+
+      // Local embeddings (no API key):  ollama pull qwen3-embedding:0.6b
+      provider: "ollama",
+      model: "qwen3-embedding:0.6b",
+      remote: { baseUrl: "http://127.0.0.1:11434" },   // embeddings go direct, not via the proxy
+
+      // For hosted embeddings instead:
+      // provider: "openai", model: "text-embedding-3-small",
+
+      sources: ["memory", "sessions"],      // "sessions" adds past transcripts
+      rememberAcrossConversations: true,
+      query: { maxResults: 6, minScore: 0.35 },
+      store: { vector: { enabled: true }, fts: { tokenizer: "unicode61" } },
+      cache: { enabled: true },
+
+      // Absolute paths to the corpus this repo builds.
+      extraPaths: [
+        { path: "<REPO_PATH>/corpus/people", pattern: "**/*.md" },
+        { path: "<REPO_PATH>/corpus/groups", pattern: "**/*.md" },
+        { path: "<REPO_PATH>/corpus/chats",  pattern: "**/*.md" },
+        { path: "<REPO_PATH>/corpus/news",   pattern: "**/*.md" },
+      ],
+    },
+  },
+  tools: {
+    sessions: { visibility: "agent" },
+    // Keep the tool surface small: a large catalog makes smaller models wander.
+    allow: ["memory_search", "message", "read", "web_search", "web_fetch"],
+  },
+}

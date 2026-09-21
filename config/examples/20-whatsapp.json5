@@ -1,0 +1,51 @@
+// WhatsApp channel. Replace every <PLACEHOLDER>.
+//
+// groupAllowFrom is the subtle one: for GROUPS it matches on the SENDER, not
+// the group. Listing only group JIDs means every group message is silently
+// blocked. List the group JID *and* each member's number.
+//
+// Find IDs with:  openclaw directory groups list --channel whatsapp
+// (stop the gateway first — it holds the session exclusively)
+{
+  channels: {
+    whatsapp: {
+      enabled: true,
+
+      dmPolicy: "allowlist",
+      allowFrom: ["<YOUR_NUMBER_DIGITS_ONLY>"],   // e.g. 15551234567
+      selfChatMode: true,                          // command it from "Message Yourself"
+
+      groupPolicy: "allowlist",
+      groupAllowFrom: [
+        "<GROUP_JID>@g.us",              // admits the conversation
+        "<YOUR_NUMBER_DIGITS_ONLY>",     // …and each member who may summon it
+        "<MEMBER_2_DIGITS_ONLY>",
+      ],
+
+      // Limit where summon phrases are evaluated at all. Without this, an
+      // allowlisted sender can trigger the bot in ANY group they share with you.
+      mentionPatterns: { mode: "allow", allowIn: ["<GROUP_JID>@g.us"] },
+
+      groups: {
+        "<GROUP_JID>@g.us": {
+          requireMention: true,          // NEVER false: it will answer everything, including itself
+          systemPrompt: "What this group is for and how to behave in it.",
+        },
+      },
+
+      // Marks messages as assistant-written. Applied by code on the reply path
+      // only — scheduled sends rely on the AGENTS.md instruction instead.
+      responsePrefix: "🤖 Assistant:",
+
+      sendReadReceipts: false,
+      actions: {
+        sendMessage: false,   // true lets it START conversations, not just reply
+        reactions: false,
+        polls: false,
+        calls: false,
+      },
+    },
+  },
+
+  commands: { ownerAllowFrom: ["whatsapp:<YOUR_NUMBER_DIGITS_ONLY>"] },
+}

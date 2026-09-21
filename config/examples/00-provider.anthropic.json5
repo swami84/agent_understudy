@@ -1,0 +1,29 @@
+// Claude via the Anthropic API.
+//
+//   export ANTHROPIC_API_KEY=sk-ant-...        (get one at console.anthropic.com)
+//
+// You do NOT need the no-think proxy with this provider — point nothing at :11435.
+// Models and prices (per 1M tokens, Anthropic first-party rates):
+//   claude-opus-5    1M ctx   $5 in / $25 out   — most capable, the default here
+//   claude-sonnet-5  1M ctx   $2 in / $10 out   — cheaper, still strong
+//   claude-haiku-4-5 200K ctx $1 in / $5 out    — fastest/cheapest
+// Use the exact IDs above; never append a date suffix.
+{
+  models: {
+    providers: {
+      anthropic: {
+        apiKey: { source: "env", provider: "anthropic", id: "ANTHROPIC_API_KEY" },
+        models: [
+          {
+            id: "claude-opus-5",
+            name: "Claude Opus 5",
+            input: ["text", "image"],
+            contextTokens: 200000,   // 1M is available; 200k keeps per-turn cost sane for chat
+            maxTokens: 2000,
+          },
+        ],
+      },
+    },
+  },
+  agents: { defaults: { model: { primary: "anthropic/claude-opus-5" } } },
+}
