@@ -84,6 +84,23 @@ Phone export gives you the **full** history. A linked-device capture
 (`ingest/capture_history.mjs`) only yields what WhatsApp pushes on an initial pair —
 about 12 days in testing.
 
+## Identity and impersonation
+
+Set in the control panel (`python3 web/server.py` -> Settings -> Identity):
+
+- **Assistant name** — also the summon word in groups. Changing it regenerates the
+  mention pattern and verifies the new pattern cannot match the assistant's own
+  output. Default `Assistant`.
+- **Write as me (impersonation)** — off by default. Off, every message carries a
+  `🤖 Name:` prefix applied by code, so recipients can see an assistant wrote it.
+  On, there is no prefix and the assistant writes in the first person in your voice.
+
+Impersonation is a deliberate choice with two consequences. People you message are
+not told a machine wrote it. And it removes the structural guard against
+self-triggering: the summon pattern excludes the attribution prefix, so with no
+prefix the assistant writing its own name re-triggers it. The panel warns on save;
+`guard/watchdog.py` is then the only backstop.
+
 ## The guard layer
 
 `python3 guard/test_guard.py` — offline, no model, no network.

@@ -134,6 +134,7 @@ def cron_jobs():
 
 def state():
     cfg = load_cfg()
+    _name, _impersonate = read_identity(cfg)
     wa = cfg.get("channels", {}).get("whatsapp", {})
     groups_cfg = wa.get("groups", {}) or {}
     gc = cfg.get("messages", {}).get("groupChat", {}) or {}
@@ -158,12 +159,107 @@ def state():
             "unmentionedInbound": gc.get("unmentionedInbound", "room_event"),
             "historyLimit": gc.get("historyLimit", 12),
             "responsePrefix": wa.get("responsePrefix", ""),
+            "assistantName": _name,
+            "impersonate": _impersonate,
             "model": cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""),
         },
         "groupPrompts": {k: (v.get("systemPrompt") or "") for k, v in groups_cfg.items()},
         "schedules": cron_jobs(),
         "contextFiles": context_files(),
     }
+
+
+# ── assistant identity ───────────────────────────────────────────────────────
+WORKSPACE = pathlib.Path.home() / ".openclaw/workspace"
+AGENTS_MD = WORKSPACE / "AGENTS.md"
+BLOCK_START = "<!-- swamai:identity:start -->"
+BLOCK_END = "<!-- swamai:identity:end -->"
+DEFAULT_NAME = "Assistant"
+
+
+def mention_pattern_for(name):
+    r"""Build a summon pattern that cannot match the assistant's own output.
+
+    The negative lookahead skips a leading attribution prefix (including an
+    emoji, matched as \W so no literal emoji ends up in the pattern — OpenClaw's
+    safe-regex check rejects patterns containing one, silently, leaving nothing
+    able to summon it).
+    """
+    esc = re.escape(name.strip().lower())
+    return rf"^(?!\W{{0,4}}\s*{esc}\s*:).*\b{esc}\b"
+
+
+def pattern_is_self_safe(pattern, name, prefix):
+    """Would the assistant's own messages re-trigger this pattern?"""
+    try:
+        rx = re.compile(pattern, re.I)
+    except re.error:
+        return False, "pattern does not compile"
+    samples = [
+        f"{prefix} {name} is now set up and listening.",
+        f"{prefix} I could not fetch that. Ask {name} again later.",
+        f"{prefix} Noted.",
+        f"{name}: mentioning {name} again without the emoji",
+    ]
+    for smp in samples:
+        if rx.search(smp.lower()):
+            return False, f"matches the assistant's own message: {smp[:52]!r}"
+    for human in (f"{name} what is the score?", f"hey {name} check this",
+                  f'"{name}" what does this mean'):
+        if not rx.search(human.lower()):
+            return False, f"does not match a normal summon: {human[:40]!r}"
+    return True, "ok"
+
+
+def read_identity(cfg):
+    wa = (cfg.get("channels") or {}).get("whatsapp") or {}
+    prefix = wa.get("responsePrefix", "")
+    impersonate = not prefix.strip()
+    m = re.match(r"^\s*(?:\W{1,4}\s*)?([A-Za-z][\w .-]{0,30}?)\s*:", prefix)
+    name = m.group(1).strip() if m else ""
+    if not name:
+        pats = ((cfg.get("messages") or {}).get("groupChat") or {}).get("mentionPatterns") or []
+        if pats:
+            mm = re.search(r"\\b([A-Za-z][\w-]{1,30})\\b", pats[0])
+            if mm:
+                name = mm.group(1)
+    return (name or DEFAULT_NAME), impersonate
+
+
+def write_identity_block(name, impersonate, emoji="🤖"):
+    """Rewrite the managed section of AGENTS.md. Everything else is untouched."""
+    if impersonate:
+        body = (
+            f"## Who you are\n\n"
+            f"You write **as the account owner, in the first person**. Do not refer to "
+            f"yourself as an assistant, a bot, or by a name. Do not add any prefix or "
+            f"signature. Match the owner's voice and register as seen in the chat "
+            f"history.\n\n"
+            f"Recipients are not told a machine wrote the message. Never claim to have "
+            f"done something in the physical world, never agree to a commitment on the "
+            f"owner's behalf, and never state a fact about the owner you cannot support "
+            f"from the conversation or the corpus. When unsure, say less.\n\n"
+            f"You are summoned in groups by the word \"{name}\". Never write that word "
+            f"yourself — it re-triggers you and causes a reply loop.\n"
+        )
+    else:
+        body = (
+            f"## Who you are\n\n"
+            f"You are **{name}**, an AI assistant acting for the account owner.\n\n"
+            f"Begin every message you send with exactly `{emoji} {name}:` then a space. "
+            f"Recipients are real people who must be able to tell an assistant wrote it. "
+            f"Never omit or reword it.\n"
+        )
+    block = f"{BLOCK_START}\n{body}{BLOCK_END}"
+    AGENTS_MD.parent.mkdir(parents=True, exist_ok=True)
+    cur = AGENTS_MD.read_text() if AGENTS_MD.exists() else ""
+    if BLOCK_START in cur and BLOCK_END in cur:
+        pre = cur.split(BLOCK_START)[0]
+        post = cur.split(BLOCK_END, 1)[1]
+        new = pre + block + post
+    else:
+        new = cur.rstrip() + "\n\n" + block + "\n"
+    AGENTS_MD.write_text(new)
 
 
 def image_search(query, limit=5):
@@ -301,6 +397,49 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"ok": True, "message": f"Saved {p.name}"}))
             except Exception as e:
                 return self._send(400, json.dumps({"ok": False, "message": str(e)}))
+
+        if u.path == "/api/identity":
+            name = (data.get("name") or "").strip()
+            impersonate = bool(data.get("impersonate"))
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.-]{1,29}", name):
+                return self._send(400, json.dumps({"ok": False,
+                    "message": "name must start with a letter and be 2-30 chars (letters, digits, space, . _ -)"}))
+            pattern = mention_pattern_for(name)
+            prefix = "" if impersonate else f"🤖 {name}:"
+            # When impersonating there is no prefix, so test the UNPREFIXED case —
+            # that is what the assistant's own messages will actually look like.
+            ok_safe, why = pattern_is_self_safe(pattern, name, prefix)
+            warning = ""
+            if not ok_safe:
+                if impersonate:
+                    # Expected: with no prefix there is nothing to key the guard off.
+                    warning = ("No attribution prefix, so the summon word cannot be excluded "
+                               "structurally. If the assistant writes its own name it will "
+                               "re-trigger. The rate limiter is the backstop.")
+                else:
+                    return self._send(400, json.dumps({"ok": False,
+                        "message": f"unsafe summon pattern: {why}"}))
+            cfg = load_cfg()
+            wa = cfg.setdefault("channels", {}).setdefault("whatsapp", {})
+            if prefix:
+                wa["responsePrefix"] = prefix
+            else:
+                wa.pop("responsePrefix", None)
+            cfg.setdefault("messages", {}).setdefault("groupChat", {})["mentionPatterns"] = [pattern]
+            ok, msg = save_cfg(cfg)
+            if not ok:
+                return self._send(400, json.dumps({"ok": False, "message": msg}))
+            try:
+                write_identity_block(name, impersonate)
+            except Exception as e:
+                return self._send(200, json.dumps({"ok": True,
+                    "message": f"{msg} (AGENTS.md not updated: {e})"}))
+            return self._send(200, json.dumps({
+                "ok": True,
+                "message": f"Saved. Summon word: \"{name}\". " +
+                           ("Impersonation ON — messages are unsigned." if impersonate
+                            else f"Messages are prefixed \"🤖 {name}:\"."),
+                "warning": warning, "pattern": pattern}))
 
         if u.path == "/api/context/new":
             kind = data.get("kind", "people")
@@ -505,6 +644,33 @@ label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weig
   </section>
 
   <section id=settings>
+    <div style="border:1px solid #2b3040;border-radius:8px;padding:14px;margin-bottom:20px">
+      <h3 style="margin:0 0 4px;font-size:14px">Identity</h3>
+      <div class=muted style=margin-bottom:12px>What it is called, and whether it signs its messages.</div>
+
+      <label class=f>Assistant name (also the summon word in groups)</label>
+      <input type=text id=assistantName placeholder="Assistant" style=max-width:320px>
+      <div class=muted style=margin-top:5px>Saying this word in an enabled group summons it. The summon
+        pattern is regenerated and checked so it cannot match the assistant's own messages.</div>
+
+      <label class=row style="margin-top:14px;align-items:flex-start;background:#201a13">
+        <input type=checkbox id=impersonate style=margin-top:3px>
+        <div>
+          <b>Write as me (impersonation)</b>
+          <div class=muted style=margin-top:3px>
+            Off: every message is prefixed <code>🤖 Name:</code> so recipients can see an assistant wrote it.<br>
+            On: no prefix, first person, in your voice — <b>recipients are not told a machine wrote it.</b>
+            It also removes the structural guard against self-triggering, leaving the rate limiter as the
+            only backstop.
+          </div>
+        </div>
+      </label>
+      <div class=bar style=border:0;margin-top:10px;padding-bottom:0>
+        <button class=act onclick=saveIdentity()>Save identity</button>
+        <span id=msg5></span>
+      </div>
+    </div>
+
     <label class=f>Who may DM the assistant (one number per line)</label>
     <textarea id=allowFrom style=min-height:80px></textarea>
     <label class=f>DM policy</label>
@@ -554,6 +720,8 @@ async function load(){
   $('sendReadReceipts').checked=s.sendReadReceipts;
   $('sendMessage').checked=s.sendMessage;
   $('responsePrefix').value=s.responsePrefix||'';
+  $('assistantName').value=s.assistantName||'';
+  $('impersonate').checked=!!s.impersonate;
   $('model').textContent=s.model||'—';
   health();
 }
@@ -659,6 +827,17 @@ async function saveCtx(){
 async function reindex(){
   flash($('msg2'),'reindexing…',true);
   const r=await post('/api/reindex',{}); flash($('msg2'),r.message,r.ok);
+}
+async function saveIdentity(){
+  const name=$('assistantName').value.trim();
+  const imp=$('impersonate').checked;
+  if(imp && !confirm(
+      'Impersonation ON\n\n'+
+      'Messages will be sent in your voice with no marker. People you message will '+
+      'not be told an AI wrote them.\n\nContinue?')) return;
+  const r=await post('/api/identity',{name,impersonate:imp});
+  flash($('msg5'), r.ok ? (r.message+(r.warning?'  ⚠ '+r.warning:'')) : r.message, r.ok);
+  if(r.ok){S=await (await fetch('/api/state')).json();$('responsePrefix').value=S.settings.responsePrefix||''}
 }
 async function saveSettings(){
   const lines=id=>$(id).value.split('\n').map(s=>s.trim()).filter(Boolean);
