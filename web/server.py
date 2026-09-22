@@ -135,6 +135,7 @@ def cron_jobs():
 def state():
     cfg = load_cfg()
     _name, _impersonate = read_identity(cfg)
+    _imp = load_impersonation()
     wa = cfg.get("channels", {}).get("whatsapp", {})
     groups_cfg = wa.get("groups", {}) or {}
     gc = cfg.get("messages", {}).get("groupChat", {}) or {}
@@ -161,6 +162,8 @@ def state():
             "responsePrefix": wa.get("responsePrefix", ""),
             "assistantName": _name,
             "impersonate": _impersonate,
+            "impersonateGroups": _imp["groups"],
+            "impersonateDms": _imp["dms"],
             "model": cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""),
         },
         "groupPrompts": {k: (v.get("systemPrompt") or "") for k, v in groups_cfg.items()},
@@ -262,6 +265,98 @@ def write_identity_block(name, impersonate, emoji="🤖"):
     AGENTS_MD.write_text(new)
 
 
+IMP_STORE = ROOT / "config" / "impersonation.json"
+PROMPT_START = "<<<identity>>>"
+PROMPT_END = "<<</identity>>>"
+
+
+def load_impersonation():
+    """{"groups": {jid: bool}, "dms": {digits: bool}} — which conversations are impersonated."""
+    if IMP_STORE.exists():
+        try:
+            d = json.loads(IMP_STORE.read_text())
+            return {"groups": d.get("groups") or {}, "dms": d.get("dms") or {}}
+        except Exception:
+            pass
+    return {"groups": {}, "dms": {}}
+
+
+def save_impersonation(m):
+    IMP_STORE.parent.mkdir(parents=True, exist_ok=True)
+    IMP_STORE.write_text(json.dumps(m, indent=2))
+
+
+def identity_prompt(name, impersonate, emoji="🤖"):
+    """The managed instruction injected into a conversation's systemPrompt."""
+    if impersonate:
+        return (
+            f"You write AS THE ACCOUNT OWNER, in the first person. Never refer to "
+            f"yourself as an assistant or bot, never use a name, never add a prefix or "
+            f"signature. Match the owner's voice from the chat history. Recipients are "
+            f"not told a machine wrote this. Never claim to have done something in the "
+            f"physical world, never accept a commitment on the owner's behalf, and never "
+            f"assert a fact about the owner you cannot support from this conversation or "
+            f"the corpus — when unsure, say less. You are summoned by the word "
+            f"\"{name}\"; never write that word yourself or you will re-trigger."
+        )
+    return (
+        f"You are {name}, an AI assistant acting for the account owner. Begin every "
+        f"message with exactly \"{emoji} {name}:\" then a space, so recipients can tell "
+        f"an assistant wrote it. Never omit or reword it."
+    )
+
+
+def set_managed_prompt(existing, managed):
+    """Replace the managed block in a systemPrompt, preserving the user's own text."""
+    existing = existing or ""
+    block = f"{PROMPT_START}\n{managed}\n{PROMPT_END}"
+    if PROMPT_START in existing and PROMPT_END in existing:
+        pre = existing.split(PROMPT_START)[0]
+        post = existing.split(PROMPT_END, 1)[1]
+        return (pre + block + post).strip()
+    return (block + "\n\n" + existing).strip() if existing.strip() else block
+
+
+def apply_identity(cfg, name, imp):
+    """Write per-conversation identity into config. Returns (warnings, any_impersonated).
+
+    responsePrefix is channel-global in OpenClaw — there is no per-conversation
+    prefix and groups has additionalProperties:false — so as soon as ONE
+    conversation is impersonated the code-applied prefix must come off, and
+    signing for the rest falls back to the per-conversation instruction.
+    """
+    wa = cfg.setdefault("channels", {}).setdefault("whatsapp", {})
+    warnings = []
+    any_imp = any(imp["groups"].values()) or any(imp["dms"].values())
+
+    groups = wa.setdefault("groups", {})
+    for jid in list(wa.get("groupAllowFrom", [])):
+        if not str(jid).endswith("@g.us"):
+            continue
+        g = groups.setdefault(jid, {})
+        g.setdefault("requireMention", True)
+        g["systemPrompt"] = set_managed_prompt(
+            g.get("systemPrompt"), identity_prompt(name, bool(imp["groups"].get(jid))))
+
+    direct = wa.setdefault("direct", {})
+    for num, on in imp["dms"].items():
+        d = direct.setdefault(num, {})
+        d["systemPrompt"] = set_managed_prompt(d.get("systemPrompt"),
+                                               identity_prompt(name, bool(on)))
+
+    if any_imp:
+        wa.pop("responsePrefix", None)
+        warnings.append(
+            "Attribution prefix removed channel-wide: OpenClaw applies responsePrefix "
+            "globally, so it cannot stay on while any conversation is impersonated. "
+            "Signed conversations now rely on their instruction, which a model can miss.")
+    else:
+        wa["responsePrefix"] = f"🤖 {name}:"
+    if not direct:
+        wa.pop("direct", None)
+    return warnings, any_imp
+
+
 def image_search(query, limit=5):
     """Keyless DuckDuckGo image search. Two-step: grab a vqd token, then query i.js."""
     import urllib.parse, urllib.request
@@ -348,11 +443,15 @@ class H(BaseHTTPRequestHandler):
             wa = cfg.setdefault("channels", {}).setdefault("whatsapp", {})
             wa["groupAllowFrom"] = list(dict.fromkeys(data.get("allow", [])))
             gset = wa.setdefault("groups", {})
+            # Only real groups get entries; groupAllowFrom also holds sender numbers.
+            allowed_jids = [j for j in wa["groupAllowFrom"] if str(j).endswith("@g.us")]
             for jid in list(gset):
-                if jid not in wa["groupAllowFrom"]:
+                if jid not in allowed_jids:
                     gset.pop(jid, None)
-            for jid in wa["groupAllowFrom"]:
-                gset[jid] = {"requireMention": bool(data.get("requireMention", {}).get(jid, True))}
+            for jid in allowed_jids:
+                # MERGE — replacing the dict wipes systemPrompt (and did, once).
+                entry = gset.setdefault(jid, {})
+                entry["requireMention"] = bool(data.get("requireMention", {}).get(jid, True))
             if not gset:
                 wa.pop("groups", None)
             ok, msg = save_cfg(cfg)
@@ -399,47 +498,52 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"ok": False, "message": str(e)}))
 
         if u.path == "/api/identity":
-            name = (data.get("name") or "").strip()
-            impersonate = bool(data.get("impersonate"))
+            cfg = load_cfg()
+            name = (data.get("name") or read_identity(cfg)[0]).strip()
             if not re.fullmatch(r"[A-Za-z][A-Za-z0-9 _.-]{1,29}", name):
                 return self._send(400, json.dumps({"ok": False,
-                    "message": "name must start with a letter and be 2-30 chars (letters, digits, space, . _ -)"}))
+                    "message": "name must start with a letter and be 2-30 chars"}))
+            imp = load_impersonation()
+            if "impersonateGroups" in data:
+                imp["groups"] = {k: bool(v) for k, v in (data["impersonateGroups"] or {}).items()}
+            if "impersonateDms" in data:
+                imp["dms"] = {re.sub(r"\D", "", k): bool(v)
+                              for k, v in (data["impersonateDms"] or {}).items() if re.sub(r"\D", "", k)}
+
             pattern = mention_pattern_for(name)
-            prefix = "" if impersonate else f"🤖 {name}:"
-            # When impersonating there is no prefix, so test the UNPREFIXED case —
-            # that is what the assistant's own messages will actually look like.
-            ok_safe, why = pattern_is_self_safe(pattern, name, prefix)
-            warning = ""
+            any_imp = any(imp["groups"].values()) or any(imp["dms"].values())
+            # With any conversation impersonated the prefix comes off channel-wide,
+            # so test the unprefixed case — that is what messages will look like.
+            ok_safe, why = pattern_is_self_safe(pattern, name, "" if any_imp else f"🤖 {name}:")
+            warnings = []
             if not ok_safe:
-                if impersonate:
-                    # Expected: with no prefix there is nothing to key the guard off.
-                    warning = ("No attribution prefix, so the summon word cannot be excluded "
-                               "structurally. If the assistant writes its own name it will "
-                               "re-trigger. The rate limiter is the backstop.")
+                if any_imp:
+                    warnings.append(
+                        "No attribution prefix while impersonating, so the summon word "
+                        "cannot be excluded structurally — if the assistant writes its own "
+                        "name it re-triggers. guard/watchdog.py is the backstop.")
                 else:
                     return self._send(400, json.dumps({"ok": False,
                         "message": f"unsafe summon pattern: {why}"}))
-            cfg = load_cfg()
-            wa = cfg.setdefault("channels", {}).setdefault("whatsapp", {})
-            if prefix:
-                wa["responsePrefix"] = prefix
-            else:
-                wa.pop("responsePrefix", None)
+
             cfg.setdefault("messages", {}).setdefault("groupChat", {})["mentionPatterns"] = [pattern]
+            w, any_imp = apply_identity(cfg, name, imp)
+            warnings += w
             ok, msg = save_cfg(cfg)
             if not ok:
                 return self._send(400, json.dumps({"ok": False, "message": msg}))
+            save_impersonation(imp)
             try:
-                write_identity_block(name, impersonate)
-            except Exception as e:
-                return self._send(200, json.dumps({"ok": True,
-                    "message": f"{msg} (AGENTS.md not updated: {e})"}))
+                write_identity_block(name, False)     # AGENTS.md keeps the default (signed) rule
+            except Exception:
+                pass
+            n_on = sum(1 for v in imp["groups"].values() if v) + sum(1 for v in imp["dms"].values() if v)
             return self._send(200, json.dumps({
                 "ok": True,
-                "message": f"Saved. Summon word: \"{name}\". " +
-                           ("Impersonation ON — messages are unsigned." if impersonate
-                            else f"Messages are prefixed \"🤖 {name}:\"."),
-                "warning": warning, "pattern": pattern}))
+                "message": f'Saved. Summon word: "{name}". '
+                           + (f"Impersonating in {n_on} conversation(s)." if n_on
+                              else "Signed in every conversation."),
+                "warning": "  ".join(warnings), "pattern": pattern}))
 
         if u.path == "/api/context/new":
             kind = data.get("kind", "people")
@@ -593,6 +697,18 @@ label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weig
         <b>Only reply when summoned</b> — otherwise it answers every message in the group, including its own
       </label>
 
+      <label class=row style="background:#201a13;margin-bottom:10px;align-items:flex-start">
+        <input type=checkbox id=gImpersonate style=margin-top:3px>
+        <div>
+          <b>Write as me in this group</b>
+          <div class=muted style=margin-top:3px>
+            Off: messages carry the <code>🤖 Name:</code> marker.
+            On: no marker, first person, in your voice — this group's members are not
+            told a machine wrote it.
+          </div>
+        </div>
+      </label>
+
       <label class=f>Instructions for this group</label>
       <div class=muted style=margin-bottom:6px>How the assistant should behave here — tone, what to focus on, what to avoid.</div>
       <textarea id=gprompt style=min-height:120px placeholder="e.g. This is a cycling group. Keep replies short and practical. Use metric distances. Never discuss work topics."></textarea>
@@ -653,18 +769,11 @@ label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weig
       <div class=muted style=margin-top:5px>Saying this word in an enabled group summons it. The summon
         pattern is regenerated and checked so it cannot match the assistant's own messages.</div>
 
-      <label class=row style="margin-top:14px;align-items:flex-start;background:#201a13">
-        <input type=checkbox id=impersonate style=margin-top:3px>
-        <div>
-          <b>Write as me (impersonation)</b>
-          <div class=muted style=margin-top:3px>
-            Off: every message is prefixed <code>🤖 Name:</code> so recipients can see an assistant wrote it.<br>
-            On: no prefix, first person, in your voice — <b>recipients are not told a machine wrote it.</b>
-            It also removes the structural guard against self-triggering, leaving the rate limiter as the
-            only backstop.
-          </div>
-        </div>
-      </label>
+      <label class=f>Write as me in these DMs (one number per line)</label>
+      <div class=muted style=margin-bottom:6px>Leave empty to sign every DM. Per-group
+        impersonation is set in <b>Groups → Configure</b>.</div>
+      <textarea id=impersonateDms style=min-height:70px placeholder="15551234567"></textarea>
+      <div class=muted id=impWarn style="margin-top:8px;color:#d29922"></div>
       <div class=bar style=border:0;margin-top:10px;padding-bottom:0>
         <button class=act onclick=saveIdentity()>Save identity</button>
         <span id=msg5></span>
@@ -721,7 +830,14 @@ async function load(){
   $('sendMessage').checked=s.sendMessage;
   $('responsePrefix').value=s.responsePrefix||'';
   $('assistantName').value=s.assistantName||'';
-  $('impersonate').checked=!!s.impersonate;
+  $('impersonateDms').value=Object.keys(s.impersonateDms||{}).filter(k=>s.impersonateDms[k]).join('\n');
+  const nImp=Object.values(s.impersonateGroups||{}).filter(Boolean).length
+            +Object.values(s.impersonateDms||{}).filter(Boolean).length;
+  $('impWarn').textContent = nImp
+    ? `Impersonating in ${nImp} conversation(s). The 🤖 marker is off channel-wide — `
+      +`OpenClaw applies responsePrefix globally, so signed conversations now rely on `
+      +`an instruction the model can miss.`
+    : '';
   $('model').textContent=s.model||'—';
   health();
 }
@@ -764,6 +880,7 @@ function cfgGroup(jid){
   $('gcfgname').textContent=g.name; $('gcfgid').textContent=jid;
   $('gprompt').value=S.groupPrompts[jid]||'';
   $('gRequireMention').checked=S.requireMention[jid]!==false;
+  $('gImpersonate').checked=!!(S.settings.impersonateGroups||{})[jid];
   const sc=S.schedules[jid];
   $('schedOn').checked=!!sc;
   $('schedMsg').value=sc?.message||'';
@@ -791,6 +908,17 @@ async function saveGroupCfg(){
   S.requireMention[cfgJid]=rm;
   const r1=await post('/api/group',{jid:cfgJid,requireMention:rm,systemPrompt:$('gprompt').value});
   if(!r1.ok)return flash($('msg4'),r1.message,false);
+  const imp=$('gImpersonate').checked;
+  if(imp && !(S.settings.impersonateGroups||{})[cfgJid] && !confirm(
+      'Write as you in this group?\n\nMessages will be sent in your voice with no '+
+      'marker. Members are not told an AI wrote them.\n\nThis also removes the '+
+      'attribution prefix for EVERY conversation — OpenClaw applies it channel-wide.'))
+    return;
+  const groups=Object.assign({},S.settings.impersonateGroups||{}); groups[cfgJid]=imp;
+  const ri=await post('/api/identity',{name:S.settings.assistantName,impersonateGroups:groups,
+                                       impersonateDms:S.settings.impersonateDms||{}});
+  if(!ri.ok)return flash($('msg4'),ri.message,false);
+  if(ri.warning) flash($('msg4'),'⚠ '+ri.warning,false);
   const r2=await post('/api/schedule',{jid:cfgJid,enabled:$('schedOn').checked,
     message:$('schedMsg').value,mode:$('schedMode').value,
     every:$('schedEvery').value,cron:$('schedCron').value,tz:$('schedTz').value});
@@ -830,12 +958,15 @@ async function reindex(){
 }
 async function saveIdentity(){
   const name=$('assistantName').value.trim();
-  const imp=$('impersonate').checked;
-  if(imp && !confirm(
-      'Impersonation ON\n\n'+
-      'Messages will be sent in your voice with no marker. People you message will '+
-      'not be told an AI wrote them.\n\nContinue?')) return;
-  const r=await post('/api/identity',{name,impersonate:imp});
+  const dms={};
+  $('impersonateDms').value.split('\n').map(x=>x.replace(/\D/g,'')).filter(Boolean)
+    .forEach(n=>dms[n]=true);
+  if(Object.keys(dms).length && !confirm(
+      'Write as you in '+Object.keys(dms).length+' DM(s)?\n\n'+
+      'Those messages carry no marker and are written in your voice. Recipients are '+
+      'not told an AI wrote them.')) return;
+  const r=await post('/api/identity',{name,impersonateGroups:S.settings.impersonateGroups||{},
+                                      impersonateDms:dms});
   flash($('msg5'), r.ok ? (r.message+(r.warning?'  ⚠ '+r.warning:'')) : r.message, r.ok);
   if(r.ok){S=await (await fetch('/api/state')).json();$('responsePrefix').value=S.settings.responsePrefix||''}
 }

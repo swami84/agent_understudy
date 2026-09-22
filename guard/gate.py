@@ -45,6 +45,23 @@ _NARRATION = [
 ]
 NARRATION = [(re.compile(p, re.I), label) for p, label in _NARRATION]
 
+# Rule sets by conversation mode. Impersonation currently shares the assistant's
+# rules — kept as a separate named profile so the two can diverge (an
+# impersonating assistant plausibly needs *stricter* rules, e.g. refusing to
+# commit on the owner's behalf) without restructuring every call site.
+PROFILES = {
+    "assistant": {"narration": _NARRATION, "max_chars": 400},
+    "impersonation": {"narration": _NARRATION, "max_chars": 400},
+}
+_COMPILED = {k: [(re.compile(p, re.I), lbl) for p, lbl in v["narration"]]
+             for k, v in PROFILES.items()}
+
+
+def profile_rules(profile):
+    """Compiled narration rules + length cap for a profile name."""
+    name = profile if profile in PROFILES else "assistant"
+    return _COMPILED[name], PROFILES[name]["max_chars"]
+
 # Runtime error strings OpenClaw itself emits into the channel.
 _RUNTIME_ERRORS = [
     r"⚠️\s*reply truncated",
@@ -79,16 +96,23 @@ def _strip_attribution(line: str) -> str:
     return ATTRIB.sub("", line, count=1)
 
 
-def _is_narration(line: str) -> str | None:
+def _is_narration(line: str, rules=None) -> str | None:
     line = _strip_attribution(line)
-    for rx, label in NARRATION:
+    for rx, label in (rules if rules is not None else NARRATION):
         if rx.search(line):
             return label
     return None
 
 
-def check_message(text: str, max_chars: int = MAX_CHARS) -> Verdict:
-    """Decide whether an outbound message may be sent, and clean it if so."""
+def check_message(text: str, max_chars: int | None = None,
+                  profile: str = "assistant") -> Verdict:
+    """Decide whether an outbound message may be sent, and clean it if so.
+
+    `profile` selects a rule set — "assistant" (signed) or "impersonation"
+    (writing as the account owner). See PROFILES.
+    """
+    rules, profile_max = profile_rules(profile)
+    max_chars = profile_max if max_chars is None else max_chars
     raw = (text or "").strip()
     if not raw:
         return Verdict("block", "", ["empty"])
@@ -111,7 +135,7 @@ def check_message(text: str, max_chars: int = MAX_CHARS) -> Verdict:
         if MEDIA_LINE.match(line):
             kept.append(line)
             continue
-        label = _is_narration(line)
+        label = _is_narration(line, rules)
         if label:
             dropped.append(line.strip())
             if label not in reasons:
@@ -166,9 +190,10 @@ def preflight_media(url: str, timeout: float = 10.0) -> tuple[bool, str]:
     return True, f"ok ({ctype})"
 
 
-def check_outbound(text: str, verify_media: bool = True) -> Verdict:
+def check_outbound(text: str, verify_media: bool = True,
+                   profile: str = "assistant") -> Verdict:
     """Full gate: narration/length checks plus MEDIA: URL verification."""
-    v = check_message(text)
+    v = check_message(text, profile=profile)
     if not v.ok or not verify_media:
         return v
     kept = []
@@ -195,6 +220,7 @@ def main() -> int:
     ap.add_argument("--text")
     ap.add_argument("--url")
     ap.add_argument("--no-media-check", action="store_true")
+    ap.add_argument("--profile", default="assistant", choices=sorted(PROFILES))
     a = ap.parse_args()
     if a.url:
         ok, why = preflight_media(a.url)
@@ -202,7 +228,7 @@ def main() -> int:
         return 0 if ok else 1
     if a.text is None:
         a.text = sys.stdin.read()
-    v = check_outbound(a.text, verify_media=not a.no_media_check)
+    v = check_outbound(a.text, verify_media=not a.no_media_check, profile=a.profile)
     print(f"action : {v.action}")
     if v.reasons:
         print(f"reasons: {', '.join(v.reasons)}")

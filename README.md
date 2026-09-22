@@ -91,15 +91,26 @@ Set in the control panel (`python3 web/server.py` -> Settings -> Identity):
 - **Assistant name** — also the summon word in groups. Changing it regenerates the
   mention pattern and verifies the new pattern cannot match the assistant's own
   output. Default `Assistant`.
-- **Write as me (impersonation)** — off by default. Off, every message carries a
-  `🤖 Name:` prefix applied by code, so recipients can see an assistant wrote it.
-  On, there is no prefix and the assistant writes in the first person in your voice.
+- **Write as me (impersonation)** — set **per conversation**, off by default.
+  Per group in *Groups → Configure*; per DM in *Settings → Identity*. A signed
+  conversation carries a `🤖 Name:` prefix; an impersonated one has no marker and
+  is written in the first person in your voice.
 
-Impersonation is a deliberate choice with two consequences. People you message are
-not told a machine wrote it. And it removes the structural guard against
-self-triggering: the summon pattern excludes the attribution prefix, so with no
-prefix the assistant writing its own name re-triggers it. The panel warns on save;
-`guard/watchdog.py` is then the only backstop.
+Three things to know before turning it on:
+
+1. **Recipients are not told a machine wrote the message.**
+2. **It takes the marker off channel-wide.** OpenClaw applies `responsePrefix`
+   globally and `groups.<jid>` has `additionalProperties: false`, so there is no
+   per-conversation prefix. The moment one conversation is impersonated the
+   code-applied marker comes off everywhere, and signed conversations fall back to
+   an instruction a model can miss.
+3. **It weakens the loop guard.** The summon pattern works by excluding the
+   attribution prefix; with no prefix, the assistant writing its own name
+   re-triggers it. `guard/watchdog.py` becomes the backstop.
+
+Impersonated conversations run the `impersonation` guard profile
+(`guard/gate.py`), currently identical to `assistant` but separate so the two can
+diverge.
 
 ## The guard layer
 
