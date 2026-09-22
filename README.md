@@ -1,4 +1,4 @@
-# swamai
+# Understudy
 
 A self-hosted personal assistant that reads and replies to your WhatsApp, built on
 [OpenClaw](https://docs.openclaw.ai/). Runs on a **local model** (Ollama) or a
@@ -31,7 +31,7 @@ each of its rules corresponds to a real message that reached a real group chat.
 npm install -g --allow-scripts=openclaw,@google/genai,koffi,tree-sitter-bash,protobufjs openclaw@latest
 
 # 2. clone and configure
-git clone <this-repo> swamai && cd swamai
+git clone <this-repo> understudy && cd understudy
 ./setup.sh                      # pick ollama | anthropic | openai
 
 # 3. install the WhatsApp channel and link a device
@@ -83,6 +83,39 @@ profile cards on your model, applies contact names, and reindexes.
 Phone export gives you the **full** history. A linked-device capture
 (`ingest/capture_history.mjs`) only yields what WhatsApp pushes on an initial pair —
 about 12 days in testing.
+
+## The control panel
+
+`python3 web/server.py` → `http://127.0.0.1:8765` (loopback only). Every config write
+is validated and rolled back if it would not load.
+
+### Groups
+
+Pick which groups the assistant may hear and reply in. *Summon only* keeps it silent
+unless the trigger word is used — leave it on.
+
+![Groups tab](docs/screenshots/groups.png)
+
+### Per-group configuration
+
+Instructions, impersonation and scheduled messages, set per conversation.
+
+![Group configuration](docs/screenshots/group-configure.png)
+
+### Context
+
+The memory the assistant retrieves from — per-person and per-group cards, plus the
+workspace files. Edit and reindex in place.
+
+![Context tab](docs/screenshots/context.png)
+
+### Settings
+
+Identity, allowlists, the summon phrase, and how much history each turn carries.
+
+![Settings tab](docs/screenshots/settings.png)
+
+*Screenshots use fictional people and groups.*
 
 ## Identity and impersonation
 

@@ -21,12 +21,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # token, which OpenClaw's own silent-reply handling suppresses cleanly — that
 # is quieter than returning empty content, which makes it emit
 # "No reply was generated for this message" into the chat.
-GATE = os.environ.get("SWAMAI_GATE", "1") != "0"
+GATE = os.environ.get("UNDERSTUDY_GATE", os.environ.get("SWAMAI_GATE", "1")) != "0"
 # The gate must only touch conversational output from THIS assistant's model.
 # Other workloads share this proxy (agentic_trading was found using it), and
 # truncating their structured JSON at 400 chars corrupts their results.
-GATE_MODELS = {m.strip() for m in os.environ.get(
-    "SWAMAI_GATE_MODELS", "qwen3.8-27b-24k,qwen3-8b-24k").split(",") if m.strip()}
+_gm = os.environ.get("UNDERSTUDY_GATE_MODELS",
+                     os.environ.get("SWAMAI_GATE_MODELS", "qwen3.8-27b-24k,qwen3-8b-24k"))
+GATE_MODELS = {m.strip() for m in _gm.split(",") if m.strip()}
 try:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
     from guard.gate import check_message

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent send-rate watchdog for the swamai assistant.
+"""Independent send-rate watchdog for the Understudy.
 
 OpenClaw implements botLoopProtection for Slack/Discord/Matrix/GoogleChat but NOT
 for WhatsApp — verified by grep against the installed plugin. A self-triggering

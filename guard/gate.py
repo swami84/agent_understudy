@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic outbound gate for the swamai assistant.
+"""Deterministic outbound gate for the Understudy.
 
 Every rule here exists because a real message reached a real WhatsApp group during
 development. Nothing in this file calls a model — it is pure text and HTTP, so it
@@ -43,6 +43,41 @@ _NARRATION = [
     (r"\bper the chat rules\b",                           "mentions-runtime"),
     (r"\bcorpus is (?:fresher|authoritative)\b",          "mentions-runtime"),
 ]
+
+# Internal-disclosure rules. The assistant must never expose how it is built:
+# these were prompted by a real reply that listed the workspace file tree into a
+# group chat. Applied to every profile.
+_LEAKS = [
+    # 1. system prompt / instructions
+    (r"\b(?:my|the) (?:system )?(?:prompt|instructions?|rules?)\b",   "leaks-system-prompt"),
+    (r"\bi (?:was|am) (?:instructed|configured|told|programmed) to\b", "leaks-system-prompt"),
+    (r"\baccording to my (?:instructions|prompt|config)\b",           "leaks-system-prompt"),
+    (r"\b(?:AGENTS|USER|MEMORY|SOUL|IDENTITY|DREAMS)\.md\b",          "leaks-system-prompt"),
+
+    # 2. stored context about people and groups
+    (r"\b(?:corpus|profile card|context card|roster|memory index)\b",  "leaks-stored-context"),
+    (r"\bi have (?:stored|saved|a record of|notes on|context on)\b",   "leaks-stored-context"),
+    (r"\bfrom (?:my|the) (?:memory|corpus|index|notes) (?:file|store)\b", "leaks-stored-context"),
+    (r"\b(?:chat|message) history (?:file|export|corpus)\b",           "leaks-stored-context"),
+
+    # 3. files and paths it can reach
+    (r"\bi have access to the following\b",                           "leaks-file-list"),
+    (r"(?:^|\s)/(?:home|etc|var|usr|tmp|opt)/\S+",                     "leaks-file-list"),
+    (r"\b[\w./-]+\.(?:md|json|json5|ya?ml|py|mjs|sqlite|log|tsv|csv|env)\b", "leaks-file-list"),
+    (r"\b(?:workspace|file tree|directory listing)\b",                 "leaks-file-list"),
+
+    # 4. model and runtime configuration
+    (r"\b(?:qwen|llama|mistral|gemma|deepseek|gpt-\d|claude-[a-z0-9-]+)\b", "leaks-model"),
+    (r"\b(?:ollama|openclaw|anthropic api|openai api)\b",              "leaks-model"),
+    (r"\b(?:num_ctx|max_?tokens|context window|temperature|keep_alive|top_[kp])\b", "leaks-model"),
+    (r"\bi(?:'m| am) (?:a|an) [\w.-]*\b(?:model|llm)\b",              "leaks-model"),
+
+    # 5. configuration generally
+    (r"\b(?:config(?:uration)? file|settings file|openclaw\.json)\b",  "leaks-config"),
+    (r"\b(?:systemPrompt|mentionPatterns|groupAllowFrom|responsePrefix|requireMention)\b", "leaks-config"),
+    (r"\b(?:api[_ ]?key|auth token|gateway token)\b",                  "leaks-config"),
+]
+
 NARRATION = [(re.compile(p, re.I), label) for p, label in _NARRATION]
 
 # Rule sets by conversation mode. Impersonation currently shares the assistant's
@@ -50,8 +85,8 @@ NARRATION = [(re.compile(p, re.I), label) for p, label in _NARRATION]
 # impersonating assistant plausibly needs *stricter* rules, e.g. refusing to
 # commit on the owner's behalf) without restructuring every call site.
 PROFILES = {
-    "assistant": {"narration": _NARRATION, "max_chars": 400},
-    "impersonation": {"narration": _NARRATION, "max_chars": 400},
+    "assistant": {"narration": _NARRATION + _LEAKS, "max_chars": 400},
+    "impersonation": {"narration": _NARRATION + _LEAKS, "max_chars": 400},
 }
 _COMPILED = {k: [(re.compile(p, re.I), lbl) for p, lbl in v["narration"]]
              for k, v in PROFILES.items()}

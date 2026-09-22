@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Config invariants for the swamai assistant. Exits non-zero on any violation.
+"""Config invariants for the Understudy. Exits non-zero on any violation.
 
 Every check corresponds to a real incident. Run it before starting the gateway —
 wire it as ExecStartPre so a bad config refuses to start rather than failing

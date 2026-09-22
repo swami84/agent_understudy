@@ -91,7 +91,7 @@ cat <<'NEXT'
   • WhatsApp:  edit config/20-whatsapp.json5, then
       openclaw config patch --file config/20-whatsapp.json5 --dry-run
       openclaw channels login --channel whatsapp     (needs a TTY; scan the QR)
-  • Guards:    systemctl --user enable --now swamai-guard.timer
+  • Guards:    systemctl --user enable --now understudy-guard.timer
   • Panel:     python3 web/server.py     -> http://127.0.0.1:8765
   • Health:    ./diag.sh
   • Read guard/README.md before enabling any group.

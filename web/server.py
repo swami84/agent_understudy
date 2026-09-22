@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local control panel for the swamai assistant.
+"""Local control panel for Understudy.
 
     python3 web/server.py          # http://127.0.0.1:8765
 
@@ -20,10 +20,15 @@ def _node_bin():
     return cands[0] if cands else ""
 
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG = pathlib.Path.home() / ".openclaw/openclaw.json"
+# Both overridable so the panel can be run against a fixture for screenshots
+# or a second profile, without touching the live install.
+ROOT = pathlib.Path(os.environ.get("UNDERSTUDY_ROOT",
+                                   pathlib.Path(__file__).resolve().parent.parent))
+CFG = pathlib.Path(os.environ.get("UNDERSTUDY_CONFIG",
+                                  pathlib.Path.home() / ".openclaw/openclaw.json"))
 GROUPS_TSV = ROOT / "config/whatsapp-groups.tsv"
-PORT = int(os.environ.get("SWAMAI_PORT", "8765"))
+WORKSPACE_OVERRIDE = os.environ.get("UNDERSTUDY_WORKSPACE")
+PORT = int(os.environ.get("UNDERSTUDY_PORT", "8765"))
 NVM_NODE = _node_bin()
 
 
@@ -141,13 +146,15 @@ def state():
     gc = cfg.get("messages", {}).get("groupChat", {}) or {}
     known = all_groups()
     known_ids = {g["id"] for g in known}
-    # include allowlisted groups even if absent from the TSV
+    # include allowlisted groups even if absent from the TSV.
+    # groupAllowFrom also holds SENDER numbers — those are not groups.
     for jid in wa.get("groupAllowFrom", []):
-        if jid not in known_ids:
+        if str(jid).endswith("@g.us") and jid not in known_ids:
             known.append({"id": jid, "name": jid})
     return {
         "groups": known,
-        "allowFromGroups": wa.get("groupAllowFrom", []),
+        "allowFromGroups": [g for g in wa.get("groupAllowFrom", []) if str(g).endswith("@g.us")],
+        "allowFromSenders": [g for g in wa.get("groupAllowFrom", []) if not str(g).endswith("@g.us")],
         "requireMention": {k: bool(v.get("requireMention", True)) for k, v in groups_cfg.items()},
         "settings": {
             "dmPolicy": wa.get("dmPolicy", "pairing"),
@@ -164,6 +171,7 @@ def state():
             "impersonate": _impersonate,
             "impersonateGroups": _imp["groups"],
             "impersonateDms": _imp["dms"],
+            "allowFromSenders": [g for g in wa.get("groupAllowFrom", []) if not str(g).endswith("@g.us")],
             "model": cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""),
         },
         "groupPrompts": {k: (v.get("systemPrompt") or "") for k, v in groups_cfg.items()},
@@ -173,7 +181,7 @@ def state():
 
 
 # ── assistant identity ───────────────────────────────────────────────────────
-WORKSPACE = pathlib.Path.home() / ".openclaw/workspace"
+WORKSPACE = pathlib.Path(WORKSPACE_OVERRIDE or (pathlib.Path.home() / ".openclaw/workspace"))
 AGENTS_MD = WORKSPACE / "AGENTS.md"
 BLOCK_START = "<!-- swamai:identity:start -->"
 BLOCK_END = "<!-- swamai:identity:end -->"
@@ -441,7 +449,9 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/api/groups":
             cfg = load_cfg()
             wa = cfg.setdefault("channels", {}).setdefault("whatsapp", {})
-            wa["groupAllowFrom"] = list(dict.fromkeys(data.get("allow", [])))
+            senders = [x for x in wa.get("groupAllowFrom", []) if not str(x).endswith("@g.us")]
+            chosen = [x for x in data.get("allow", []) if str(x).endswith("@g.us")]
+            wa["groupAllowFrom"] = list(dict.fromkeys(chosen + senders))
             gset = wa.setdefault("groups", {})
             # Only real groups get entries; groupAllowFrom also holds sender numbers.
             allowed_jids = [j for j in wa["groupAllowFrom"] if str(j).endswith("@g.us")]
@@ -637,41 +647,103 @@ def _valid_re(p):
         return False
 
 
-PAGE = r"""<!doctype html><meta charset=utf-8><title>swamai control</title>
+PAGE = r"""<!doctype html><meta charset=utf-8><title>Understudy</title>
 <style>
+:root{
+  --bg:#0b0d12; --panel:#12151c; --panel-2:#171b24; --line:#232836;
+  --ink:#e8ebf2; --ink-dim:#98a1b5; --ink-faint:#6b7488;
+  --accent:#5b8dff; --accent-soft:#1c2740;
+  --ok:#3fb950; --warn:#e3b341; --bad:#f85149;
+  --radius:10px;
+}
 *{box-sizing:border-box}
-body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;background:#0f1115;color:#e6e8ee}
-header{padding:14px 20px;border-bottom:1px solid #232733;display:flex;gap:16px;align-items:center;position:sticky;top:0;background:#0f1115;z-index:5}
-h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}
-.on{background:#3fb950}.off{background:#f85149}
-nav{display:flex;gap:4px;padding:0 20px;border-bottom:1px solid #232733;background:#0f1115;position:sticky;top:53px;z-index:4}
-nav button{background:none;border:0;color:#8b93a7;padding:11px 14px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
-nav button.sel{color:#e6e8ee;border-bottom-color:#4b8bf5}
-main{padding:20px;max-width:1000px}
-section{display:none}section.sel{display:block}
-.row{display:flex;gap:10px;align-items:center;padding:7px 10px;border-radius:6px}
-.row:hover{background:#161a22}
-.row.on{background:#132018}
-.muted{color:#8b93a7;font-size:12.5px}
-input[type=text],textarea,select{background:#161a22;border:1px solid #2b3040;color:#e6e8ee;border-radius:6px;padding:8px 10px;font:inherit;width:100%}
-textarea{min-height:440px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;line-height:1.6}
-button.act{background:#2c6cd6;border:0;color:#fff;padding:8px 15px;border-radius:6px;cursor:pointer;font:inherit;font-weight:550}
-button.act:hover{background:#3a7ce4}
-button.ghost{background:#1b202b;border:1px solid #2b3040;color:#c9cfdd}
-label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weight:550}
-.bar{position:sticky;bottom:0;background:#0f1115;border-top:1px solid #232733;padding:12px 0;display:flex;gap:10px;align-items:center;margin-top:18px}
-#msg{font-size:13px}.ok{color:#3fb950}.err{color:#f85149}
-.grid{display:grid;grid-template-columns:260px 1fr;gap:16px}
-.list{max-height:520px;overflow:auto;border:1px solid #232733;border-radius:8px;padding:6px}
-.list button{display:block;width:100%;text-align:left;background:none;border:0;color:#c9cfdd;padding:7px 9px;border-radius:5px;cursor:pointer;font:inherit}
-.list button.sel{background:#1d2635;color:#fff}
-.tag{font-size:10.5px;color:#7d8595}
-.count{color:#8b93a7;font-weight:400}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14.5px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased}
+code{font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:var(--panel-2);padding:1px 5px;border-radius:4px;color:#c9d4ee}
+
+header{display:flex;gap:14px;align-items:center;padding:14px 24px;
+  background:rgba(11,13,18,.92);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}
+h1{margin:0;font-size:15.5px;font-weight:650;letter-spacing:-.01em}
+h1 .tag{color:var(--ink-faint);font-weight:400;margin-left:8px;font-size:12.5px}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;
+  padding:3px 10px;border-radius:999px;background:var(--panel-2);
+  border:1px solid var(--line);color:var(--ink-dim)}
+.dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.on{background:var(--ok);box-shadow:0 0 0 3px rgba(63,185,80,.15)}
+.off{background:var(--bad);box-shadow:0 0 0 3px rgba(248,81,73,.15)}
+
+nav{display:flex;gap:2px;padding:0 24px;background:var(--bg);
+  border-bottom:1px solid var(--line);position:sticky;top:57px;z-index:19}
+nav button{background:none;border:0;color:var(--ink-dim);padding:12px 16px;
+  cursor:pointer;font:inherit;font-size:14px;border-bottom:2px solid transparent;
+  transition:color .15s,border-color .15s}
+nav button:hover{color:var(--ink)}
+nav button.sel{color:var(--ink);border-bottom-color:var(--accent);font-weight:550}
+
+main{padding:26px 24px 60px;max-width:1040px}
+section{display:none;animation:fade .18s ease}
+section.sel{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1}}
+
+.card{background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--radius);padding:18px;margin-bottom:18px}
+.card h3{margin:0 0 3px;font-size:14.5px;font-weight:600;letter-spacing:-.01em}
+.lead{color:var(--ink-dim);font-size:13px;margin-bottom:16px}
+
+.row{display:flex;gap:11px;align-items:center;padding:9px 11px;border-radius:8px;
+  transition:background .12s}
+.row:hover{background:var(--panel-2)}
+.row.on{background:rgba(91,141,255,.07);box-shadow:inset 2px 0 0 var(--accent)}
+.muted{color:var(--ink-dim);font-size:12.5px}
+.count{color:var(--ink-faint);font-weight:400}
+
+input[type=text],textarea,select{background:var(--panel-2);border:1px solid var(--line);
+  color:var(--ink);border-radius:8px;padding:9px 11px;font:inherit;font-size:13.5px;
+  width:100%;transition:border-color .15s,box-shadow .15s}
+input[type=text]:focus,textarea:focus,select:focus{outline:0;border-color:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft)}
+textarea{min-height:420px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:12.5px;line-height:1.65;resize:vertical}
+input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px;cursor:pointer}
+label.f{display:block;margin:16px 0 6px;font-size:12.5px;color:var(--ink-dim);
+  font-weight:600;letter-spacing:.01em}
+
+button.act{background:var(--accent);border:0;color:#fff;padding:9px 17px;
+  border-radius:8px;cursor:pointer;font:inherit;font-size:13.5px;font-weight:550;
+  transition:background .15s,transform .05s}
+button.act:hover{background:#6f9bff}
+button.act:active{transform:translateY(1px)}
+button.ghost{background:var(--panel-2);border:1px solid var(--line);color:var(--ink-dim)}
+button.ghost:hover{background:#1d2230;color:var(--ink)}
+
+.bar{position:sticky;bottom:0;background:linear-gradient(transparent,var(--bg) 26%);
+  padding:18px 0 8px;display:flex;gap:10px;align-items:center;margin-top:18px}
+#msg,#msg2,#msg3,#msg4,#msg5{font-size:13px}
+.ok{color:var(--ok)}.err{color:var(--bad)}
+
+.grid{display:grid;grid-template-columns:250px 1fr;gap:18px}
+.list{max-height:520px;overflow:auto;border:1px solid var(--line);
+  border-radius:var(--radius);padding:7px;background:var(--panel)}
+.list button{display:block;width:100%;text-align:left;background:none;border:0;
+  color:var(--ink-dim);padding:8px 10px;border-radius:7px;cursor:pointer;font:inherit;
+  font-size:13.5px;transition:background .12s,color .12s}
+.list button:hover{background:var(--panel-2);color:var(--ink)}
+.list button.sel{background:var(--accent-soft);color:#fff;font-weight:550}
+
+.danger{background:rgba(227,179,65,.07);border:1px solid rgba(227,179,65,.28);
+  border-radius:8px;padding:12px 13px}
+.danger b{color:var(--warn)}
+#glist{max-height:460px;overflow:auto;margin-top:4px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#242a38;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#2e3546}
 </style>
 <header>
-  <h1>swamai control</h1>
-  <span class=muted id=health>checking…</span>
+  <h1>Understudy<span class=tag>control panel</span></h1>
+  <span id=health class=muted>checking…</span>
   <span style=flex:1></span>
   <button class="act ghost" onclick=restart()>Restart gateway</button>
 </header>
@@ -688,8 +760,8 @@ label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weig
     <div id=glist></div>
     <div class=bar><button class=act onclick=saveGroups()>Save groups</button><span id=msg></span></div>
 
-    <div id=gcfg style="display:none;margin-top:26px;border-top:1px solid #232733;padding-top:18px">
-      <h3 style="margin:0 0 4px;font-size:14px">Configure <span id=gcfgname></span></h3>
+    <div id=gcfg class=card style="display:none;margin-top:26px">
+      <h3>Configure <span id=gcfgname></span></h3>
       <div class=muted id=gcfgid style=margin-bottom:12px></div>
 
       <label class=row style="background:#132018;margin-bottom:10px">
@@ -697,7 +769,7 @@ label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weig
         <b>Only reply when summoned</b> — otherwise it answers every message in the group, including its own
       </label>
 
-      <label class=row style="background:#201a13;margin-bottom:10px;align-items:flex-start">
+      <label class="row danger" style="margin-bottom:12px;align-items:flex-start">
         <input type=checkbox id=gImpersonate style=margin-top:3px>
         <div>
           <b>Write as me in this group</b>
@@ -760,9 +832,9 @@ label.f{display:block;margin:14px 0 5px;font-size:12.5px;color:#a8b0c2;font-weig
   </section>
 
   <section id=settings>
-    <div style="border:1px solid #2b3040;border-radius:8px;padding:14px;margin-bottom:20px">
-      <h3 style="margin:0 0 4px;font-size:14px">Identity</h3>
-      <div class=muted style=margin-bottom:12px>What it is called, and whether it signs its messages.</div>
+    <div class=card>
+      <h3>Identity</h3>
+      <div class=lead>What it is called, and whether it signs its messages.</div>
 
       <label class=f>Assistant name (also the summon word in groups)</label>
       <input type=text id=assistantName placeholder="Assistant" style=max-width:320px>
@@ -843,15 +915,18 @@ async function load(){
 }
 async function health(){
   try{const h=await (await fetch('/api/status')).json();
-    $('health').innerHTML=`<span class="dot ${h.gateway?'on':'off'}"></span>gateway `+
-      `<span class="dot ${h.whatsappLinked?'on':'off'}"></span>whatsapp`;
+    $('health').innerHTML=
+      `<span class=pill><span class="dot ${h.gateway?'on':'off'}"></span>gateway</span>`+
+      `<span class=pill style=margin-left:8px><span class="dot ${h.whatsappLinked?'on':'off'}"></span>whatsapp</span>`;
   }catch(e){$('health').textContent='status unavailable'}
 }
 function renderGroups(){
   const f=($('gfilter').value||'').toLowerCase();
   const on=new Set(S.allowFromGroups);
   const list=S.groups.filter(g=>!f||g.name.toLowerCase().includes(f)||g.id.includes(f));
-  $('gcount').textContent=`${on.size} enabled of ${S.groups.length} groups`;
+  $('gcount').textContent=`${on.size} enabled of ${S.groups.length} groups`+
+    (S.settings.allowFromSenders&&S.settings.allowFromSenders.length
+      ? `  ·  ${S.settings.allowFromSenders.length} allowed sender(s)` : '');
   $('glist').innerHTML=list.map(g=>{
     const en=on.has(g.id), rm=S.requireMention[g.id]!==false;
     return `<div class="row ${en?'on':''}">

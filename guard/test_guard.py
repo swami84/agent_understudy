@@ -30,6 +30,18 @@ LEAKED = [
     "NO_REPLY",
 ]
 
+# Internal disclosure — the assistant must never explain how it is built.
+LEAKS = [
+    "🤖 Assistant: I have access to the following files in the workspace: AGENTS.md, USER.md, MEMORY.md",
+    "🤖 Assistant: My system prompt says to keep replies short.",
+    "🤖 Assistant: I'm running qwen3.8:27b via Ollama with num_ctx 24576.",
+    "🤖 Assistant: According to my instructions I should not discuss work.",
+    "🤖 Assistant: I have stored context on that person from the corpus.",
+    "🤖 Assistant: Your config is at /home/user/.openclaw/openclaw.json",
+    "🤖 Assistant: The groupAllowFrom setting controls who can message me.",
+    "🤖 Assistant: I was instructed to only reply when summoned.",
+]
+
 # Real good replies that must survive untouched.
 GOOD = [
     "🤖 SwamAI: SPCX closed yesterday at $150.21, +8.34%.",
@@ -54,6 +66,16 @@ def run():
                       "truncated", "no reply was generated", "per the chat rules"))
         print(f"  {'PASS' if ok else 'FAIL'}  {v.action:<5} {','.join(v.reasons)[:34]:<34} {t[:46]!r}")
         if not ok: fails.append(("leak", t))
+
+    print("\n── internal disclosure must be blocked (both profiles) ──")
+    for prof in ("assistant", "impersonation"):
+        for t in LEAKS:
+            v = check_message(t, profile=prof)
+            ok = v.action in ("block", "strip")
+            if prof == "assistant":
+                print(f"  {'PASS' if ok else 'FAIL'}  {v.action:<5} {','.join(v.reasons)[:30]:<30} {t[14:54]!r}")
+            if not ok: fails.append(("leak-" + prof, t))
+    print(f"  (both profiles checked: {len(LEAKS)} cases x 2)")
 
     print("\n── good replies must pass unchanged ──")
     for t in GOOD:
