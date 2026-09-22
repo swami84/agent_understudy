@@ -1,4 +1,4 @@
-# Understudy
+# Agent Understudy
 
 A self-hosted personal assistant that reads and replies to your WhatsApp, built on
 [OpenClaw](https://docs.openclaw.ai/). Runs on a **local model** (Ollama) or a
@@ -31,7 +31,7 @@ each of its rules corresponds to a real message that reached a real group chat.
 npm install -g --allow-scripts=openclaw,@google/genai,koffi,tree-sitter-bash,protobufjs openclaw@latest
 
 # 2. clone and configure
-git clone <this-repo> understudy && cd understudy
+git clone <this-repo> agent-understudy && cd agent-understudy
 ./setup.sh                      # pick ollama | anthropic | openai
 
 # 3. install the WhatsApp channel and link a device

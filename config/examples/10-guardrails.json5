@@ -8,7 +8,7 @@
       // attribution prefix ("🤖 Assistant: ...") including an emoji.
       // Never put a literal emoji IN the pattern — OpenClaw's safe-regex check
       // rejects the whole pattern silently and nothing can summon it.
-      mentionPatterns: ["^(?!\\W{0,4}\\s*assistant\\s*:).*\\bassistant\\b"],
+      mentionPatterns: ["^(?!\\W{0,4}\\s*understudy\\s*:).*\\bunderstudy\\b"],
 
       // Unmentioned group chatter becomes quiet context, never a reply.
       unmentionedInbound: "room_event",

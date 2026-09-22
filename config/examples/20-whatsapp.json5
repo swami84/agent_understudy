@@ -35,7 +35,7 @@
 
       // Marks messages as assistant-written. Applied by code on the reply path
       // only — scheduled sends rely on the AGENTS.md instruction instead.
-      responsePrefix: "🤖 Assistant:",
+      responsePrefix: "🤖 Understudy:",
 
       sendReadReceipts: false,
       actions: {

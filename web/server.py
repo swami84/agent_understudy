@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local control panel for Understudy.
+"""Local control panel for Agent Understudy.
 
     python3 web/server.py          # http://127.0.0.1:8765
 
@@ -185,7 +185,7 @@ WORKSPACE = pathlib.Path(WORKSPACE_OVERRIDE or (pathlib.Path.home() / ".openclaw
 AGENTS_MD = WORKSPACE / "AGENTS.md"
 BLOCK_START = "<!-- swamai:identity:start -->"
 BLOCK_END = "<!-- swamai:identity:end -->"
-DEFAULT_NAME = "Assistant"
+DEFAULT_NAME = "Understudy"
 
 
 def mention_pattern_for(name):
@@ -647,7 +647,7 @@ def _valid_re(p):
         return False
 
 
-PAGE = r"""<!doctype html><meta charset=utf-8><title>Understudy</title>
+PAGE = r"""<!doctype html><meta charset=utf-8><title>Agent Understudy</title>
 <style>
 :root{
   --bg:#f7f8fa; --panel:#ffffff; --panel-2:#f1f3f7; --line:#dfe3ea;
@@ -745,7 +745,7 @@ button.ghost:hover{background:var(--panel-2);color:var(--ink)}
 ::-webkit-scrollbar-thumb:hover{background:#b3bcce}
 </style>
 <header>
-  <h1>Understudy<span class=tag>control panel</span></h1>
+  <h1>Agent Understudy<span class=tag>control panel</span></h1>
   <span id=health class=muted>checking…</span>
   <span style=flex:1></span>
   <button class="act ghost" onclick=restart()>Restart gateway</button>
