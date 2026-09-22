@@ -8,6 +8,10 @@ It builds a searchable memory from your own chat history: exported conversations
 parsed into session-chunked markdown, summarised into per-person and per-group context
 cards, and indexed into SQLite FTS5 + sqlite-vec. No external vector database.
 
+On top of that sits a **temporal layer** — every remembered fact carries the date it
+refers to, so the assistant can tell a plan from a memory of one. Cards are refreshed
+incrementally: a week of new messages rebuilds a month of one chat, not the corpus.
+
 > **Read this first.** WhatsApp has no sanctioned automation path for personal
 > accounts. This connects via WhatsApp Web (Baileys) as a linked device, which is
 > against WhatsApp's terms and can get your number banned. Enforcement correlates
@@ -83,6 +87,56 @@ profile cards on your model, applies contact names, and reindexes.
 Phone export gives you the **full** history. A linked-device capture
 (`ingest/capture_history.mjs`) only yields what WhatsApp pushes on an initial pair —
 about 12 days in testing.
+
+## The temporal layer
+
+A summary card states that someone is "planning a ride on Saturday the 13th" with the
+same confidence whether that Saturday is next week or fifteen months gone. The model
+cannot tell the difference — it is not given today's date, and the card has no dates in
+it at all. So the assistant cheerfully brings up a trip that already happened, or treats
+a cancelled plan as live.
+
+`ingest/build_temporal.py` writes a dated timeline card per chat and per person:
+
+- **Every fact carries two dates** — when it happened, and which month it was learned
+  in. That is what lets a later statement override an earlier one without asking a
+  model to reconcile them.
+- **Recency is computed at read time**, never stored. A card written in June does not
+  still claim June is current when it is read in October; facts fall through
+  *this month* → *recent* → *may be out of date* → *archive* on their own.
+- **Open threads are resolved, not just listed.** A commitment is matched forward
+  through later months and comes out as `open`, `date passed`, or `went quiet`.
+- **The free half needs no model at all.** First and last seen, per-month volume as a
+  sparkline, activity trend, peak hours, who talks to whom — counted, not inferred, so
+  it is the part that is never wrong. `--no-llm` builds only this.
+
+```bash
+python3 ingest/build_temporal.py --no-llm    # deterministic only, no GPU
+python3 ingest/test_temporal.py              # offline, no model, no network
+```
+
+## Incremental refresh
+
+A full rebuild reads every message with a 27B and takes hours; almost none of that work
+is new. Extraction is keyed to **calendar months**, not a sliding window — a "last 30
+days" window changes contents daily, so anything derived from it must be rebuilt daily,
+which at a few hundred groups is the whole corpus every night. A closed month is frozen
+the moment it ends, so the model reads it exactly once, ever. Steady state is one call
+per active chat per month.
+
+Cards follow the same rule through `corpus/.manifest.json`, which hashes the messages
+that feed each card — not file mtimes, since re-parsing an unchanged export rewrites
+every file. A card is rebuilt when its inputs change by more than `--min-delta`
+messages, so one new message does not trigger a 27B rewrite of the corpus.
+
+```bash
+python3 ingest/refresh.py            # plan only: what would rebuild, and what it costs
+python3 ingest/refresh.py --apply    # do it
+```
+
+It plans by default and spends nothing. On a shared GPU it refuses to start while
+another model is resident (pass `--shared` to override) and unloads what it loaded when
+it finishes.
 
 ## The control panel
 
@@ -183,12 +237,14 @@ Things that cost real debugging time, in case they save you some:
   field is `expr`, not `expression`.
 - **Context**: OpenClaw's system prompt runs ~8k tokens before your history. A 16k
   context window overflows and truncates mid-sentence (`stopReason=length`).
+- **Nothing tells the model what today is.** Without it, every dated fact in memory
+  reads as equally current — which is the whole reason the temporal layer exists.
 
 ## Layout
 
 ```
 guard/      output gate, rate limiter, config invariants, tests
-ingest/     export parser, profile/context builders, contact import, news digest
+ingest/     export parser, profile/context/timeline builders, incremental refresh
 proxy/      Ollama no-think proxy (also where the output gate is enforced)
 web/        local control panel on :8765
 ollama/     Modelfiles with pinned context sizes
@@ -208,6 +264,10 @@ corpus/     your data (gitignored)
 - **Images** need a real image-search API; keyless sources cover reference photos, not
   news.
 - **Slack** is configurable but this repo has focused on WhatsApp.
+- **Retrieval is flat.** Top-k over a single index holds fine for a handful of chats;
+  past roughly 25 groups, six chunks out of tens of thousands stops discriminating, and
+  cross-chat identity (one person, several names and numbers) needs a graph rather than
+  embeddings. The temporal layer is a prerequisite for that, not a substitute.
 
 ## License
 

@@ -1,10 +1,13 @@
 # ── personal data: never commit ──
 # (git does NOT support inline comments — every comment must be its own line)
-corpus/raw/
-corpus/chats/
-corpus/people/
-corpus/groups/
-corpus/news/
+#
+# Allowlist, not denylist. Everything the pipeline generates under corpus/ is
+# derived from real chats and carries real names, and each new stage used to need
+# its own rule here — one missing line is how 13 months of history and a 732-entry
+# address book once got staged for a public repo. Ignore the directory and name
+# the exceptions instead, so a stage added later is private by default.
+corpus/*
+!corpus/README.md
 
 # ── local config: tokens, phone numbers, group IDs ──
 config/*.json

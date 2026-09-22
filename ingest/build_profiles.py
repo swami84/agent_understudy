@@ -11,6 +11,9 @@ you talk about, and how they write. Runs entirely on local GPU.
 import argparse, json, pathlib, re, sys, urllib.error, urllib.request
 from collections import defaultdict
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import temporal as T
+
 OLLAMA = "http://127.0.0.1:11434/api/chat"
 BULLET = re.compile(r"^- \*\*(?P<sender>.+?)\*\* \((?P<time>\d{2}:\d{2})\): (?P<body>.*)$")
 
@@ -133,6 +136,7 @@ def ask(model, prompt, timeout):
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "think": False,
+        "keep_alive": "5m",
         "options": {"temperature": 0.2, "num_ctx": 32768},
     }
     req = urllib.request.Request(
@@ -152,6 +156,10 @@ def main():
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--only", help="substring match on name")
     ap.add_argument("--force", action="store_true", help="rewrite existing cards")
+    ap.add_argument("--min-delta", type=int, default=25,
+                    help="new messages needed before a card is worth rewriting")
+    ap.add_argument("--max-age-days", type=int, default=90,
+                    help="refresh a changed card at least this often")
     ap.add_argument("--dry-run", action="store_true", help="list who would be built")
     args = ap.parse_args()
 
@@ -175,14 +183,26 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     print(f"{len(targets)} profile(s) to build (>= {args.min_messages} msgs)", file=sys.stderr)
 
-    built = skipped = failed = 0
+    man = T.Manifest()
+    built = skipped = adopted = failed = 0
     for name, d in targets:
         dest = outdir / f"{slug(self_name or name) if name.strip().lower() in self_labels else slug(name)}.md"
-        if dest.exists() and not args.force:
+        # Hash the messages that feed this card, not the file's mtime: re-parsing
+        # the same export rewrites every month file, and mtime would then rebuild
+        # the entire corpus on a run that changed nothing.
+        key = f"profile:{dest.stem}"
+        ihash = T.content_hash(*(b for _, _, b in d["msgs"]))
+        need, why = man.stale(key, ihash, count=len(d["msgs"]), min_delta=args.min_delta,
+                              max_age_days=args.max_age_days, force=args.force)
+        if dest.exists() and why == "new":
+            man.adopt(key, ihash, count=len(d["msgs"]), model=args.model)
+            adopted += 1
+            continue
+        if dest.exists() and not need:
             skipped += 1
             continue
         if args.dry_run:
-            print(f"  would build: {name} ({len(d['msgs'])} msgs, {len(d['chats'])} chats)")
+            print(f"  would build: {name} ({len(d['msgs'])} msgs, {len(d['chats'])} chats) — {why}")
             continue
         is_self = name.strip().lower() in self_labels
         tmpl = SELF_PROMPT if is_self else PROMPT
@@ -206,11 +226,16 @@ def main():
             f"**Generated:** locally by {args.model}. Derived, not verbatim — verify before relying on it.\n\n"
         )
         dest.write_text(header + body + "\n", encoding="utf-8")
+        man.record(key, ihash, count=len(d["msgs"]), model=args.model)
         built += 1
-        print(f"  {name} ({len(d['msgs'])} msgs) -> {dest}", file=sys.stderr)
+        print(f"  {name} ({len(d['msgs'])} msgs, {why}) -> {dest}", file=sys.stderr)
 
-    print(f"\nbuilt={built} skipped={skipped} failed={failed}"
-          + ("  (use --force to rewrite)" if skipped else ""), file=sys.stderr)
+    if not args.dry_run:
+        man.save()
+    print(f"\nbuilt={built} skipped={skipped + adopted} failed={failed}"
+          + (f"  ({adopted} existing card(s) {'would be adopted' if args.dry_run else 'adopted'} into the manifest)" if adopted else "")
+          + ("  (unchanged since last build; --force to rewrite)" if skipped else ""),
+          file=sys.stderr)
     return 0
 
 

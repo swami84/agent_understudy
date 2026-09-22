@@ -22,16 +22,16 @@ if [ ${#FILES[@]} -eq 0 ]; then
   exit 1
 fi
 
-echo "── 1/5  parsing ${#FILES[@]} export(s) ──"
+echo "── 1/6  parsing ${#FILES[@]} export(s) ──"
 python3 ingest/parse_export.py "${FILES[@]}"
 
-echo "── 2/5  building profile cards (local GPU, slow) ──"
+echo "── 2/6  building profile cards (local GPU, slow) ──"
 python3 ingest/build_profiles.py --min-messages "$MIN_MSGS"
 
-echo "── 3/5  building group context cards ──"
+echo "── 3/6  building group context cards ──"
 python3 ingest/build_group_context.py
 
-echo "── 4/5  applying contact names ──"
+echo "── 4/6  applying contact names ──"
 CONTACTS=(corpus/raw/*.vcf corpus/raw/*.csv)
 if [ ${#CONTACTS[@]} -gt 0 ]; then
   python3 ingest/import_contacts.py "${CONTACTS[@]}" --apply || true
@@ -39,13 +39,18 @@ else
   echo "  (no address book in corpus/raw/ — skipping)"
 fi
 
-echo "── 5/5  reindexing ──"
+echo "── 5/6  building dated timelines ──"
+python3 ingest/build_temporal.py
+
+echo "── 6/6  reindexing ──"
 openclaw memory index --force --agent main
 
 echo
 echo "done. corpus now holds:"
-for d in chats people groups; do
+for d in chats people groups timeline; do
   printf "  corpus/%-7s %s file(s)\n" "$d" "$(find "corpus/$d" -type f 2>/dev/null | wc -l)"
 done
+echo
+echo "after this, use ingest/refresh.py — it rebuilds only what changed."
 echo
 echo "try:  openclaw memory search \"what does <person> usually talk about\" --agent main"

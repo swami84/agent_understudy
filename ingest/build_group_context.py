@@ -10,6 +10,9 @@ corpus/groups/<slug>-context.md, leaving the roster file (<slug>.md) untouched.
 import argparse, json, pathlib, re, sys, urllib.error, urllib.request
 from collections import Counter
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import temporal as T
+
 OLLAMA = "http://127.0.0.1:11434/api/chat"
 BULLET = re.compile(r"^- \*\*(?P<sender>.+?)\*\* \((?P<time>\d{2}:\d{2})\): (?P<body>.*)$")
 
@@ -57,7 +60,7 @@ def self_name():
 
 def ask(model, prompt, timeout):
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-               "stream": False, "think": False,
+               "stream": False, "think": False, "keep_alive": "5m",
                "options": {"temperature": 0.2, "num_ctx": 32768}}
     req = urllib.request.Request(OLLAMA, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -75,6 +78,10 @@ def main():
     ap.add_argument("--min-messages", type=int, default=20)
     ap.add_argument("--only")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--min-delta", type=int, default=40,
+                    help="new messages needed before a card is worth rewriting")
+    ap.add_argument("--max-age-days", type=int, default=90)
+    ap.add_argument("--dry-run", action="store_true", help="list what would be built")
     args = ap.parse_args()
 
     me = self_name()
@@ -92,7 +99,8 @@ def main():
 
     outdir = pathlib.Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
-    built = skipped = failed = 0
+    man = T.Manifest()
+    built = skipped = adopted = failed = 0
 
     for d in dirs:
         months = sorted(f.stem for f in d.glob("*.md"))
@@ -112,8 +120,19 @@ def main():
             print(f"  skip {d.name}: only {len(msgs)} message(s)", file=sys.stderr)
             continue
         dest = outdir / f"{d.name}-context.md"
-        if dest.exists() and not args.force:
+        key = f"group:{d.name}"
+        ihash = T.content_hash(*(b for _, _, b in msgs))
+        need, why = man.stale(key, ihash, count=len(msgs), min_delta=args.min_delta,
+                              max_age_days=args.max_age_days, force=args.force)
+        if dest.exists() and why == "new":
+            man.adopt(key, ihash, count=len(msgs), model=args.model)
+            adopted += 1
+            continue
+        if dest.exists() and not need:
             skipped += 1
+            continue
+        if args.dry_run:
+            print(f"  would build: {d.name} ({len(msgs)} msgs) — {why}")
             continue
 
         step = max(1, len(msgs) // 250)
@@ -142,11 +161,16 @@ def main():
                   f"**Members:** {', '.join(n for n, _ in senders.most_common(15))}\n"
                   f"**Generated:** locally by {args.model}. Derived, not verbatim.\n\n")
         dest.write_text(header + body + "\n", encoding="utf-8")
+        man.record(key, ihash, count=len(msgs), model=args.model)
         built += 1
-        print(f"  {d.name} ({len(msgs)} msgs) -> {dest}", file=sys.stderr)
+        print(f"  {d.name} ({len(msgs)} msgs, {why}) -> {dest}", file=sys.stderr)
 
-    print(f"\nbuilt={built} skipped={skipped} failed={failed}"
-          + ("  (--force to rewrite)" if skipped else ""), file=sys.stderr)
+    if not args.dry_run:
+        man.save()
+    print(f"\nbuilt={built} skipped={skipped + adopted} failed={failed}"
+          + (f"  ({adopted} existing card(s) {'would be adopted' if args.dry_run else 'adopted'} into the manifest)" if adopted else "")
+          + ("  (unchanged since last build; --force to rewrite)" if skipped else ""),
+          file=sys.stderr)
     return 0
 
 

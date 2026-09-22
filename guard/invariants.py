@@ -21,7 +21,7 @@ DEFAULT_CFG = pathlib.Path.home() / ".openclaw/openclaw.json"
 WORKSPACE = pathlib.Path.home() / ".openclaw/workspace"
 
 # Messages the bot itself has sent. A mention pattern matching ANY of these
-# creates a self-reply loop — this is what produced 93 messages to BHP Tennis.
+# creates a self-reply loop — this is what produced 93 messages to one group.
 BOT_SAMPLES = [
     "🤖 SwamAI: SwamAI is now set up and listening.",
     "🤖 SwamAI: I'm unable to fetch that. Ask SwamAI again later.",
