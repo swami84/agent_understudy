@@ -114,13 +114,22 @@ def run():
         ("no member numbers", {"groupAllowFrom": ["120363000000000000@g.us"]}, "no-sender-allowlist"),
         ("scope gap", {"mentionPatterns": {"mode": "allow", "allowIn": []}}, "scope-gap"),
         ("block streaming on", {"_bs": "on"}, "block-streaming"),
-        ("direct ollama, no proxy", {"_url": "http://127.0.0.1:11434"}, "no-nothink-proxy"),
+        ("direct ollama, no proxy", {"_url": "http://127.0.0.1:11434"}, "no-gate-proxy"),
+        # Strata needs no think:false — reasoning arrives in its own field — so the
+        # proxy here is purely the gate, and bypassing it fails completely silently.
+        ("direct strata, gate bypassed", {"_strata": "http://127.0.0.1:8080/v1"}, "no-gate-proxy"),
+        ("strata via the proxy", {"_strata": "http://127.0.0.1:11435/v1"}, None),
     ]
     for name, patch, want in cases:
         cfg = copy.deepcopy(base)
         if "_pat" in patch: cfg["messages"]["groupChat"]["mentionPatterns"] = patch["_pat"]
         elif "_bs" in patch: cfg["agents"]["defaults"]["blockStreamingDefault"] = patch["_bs"]
         elif "_url" in patch: cfg["models"]["providers"]["ollama"]["baseUrl"] = patch["_url"]
+        elif "_strata" in patch:
+            cfg["models"]["providers"]["strata"] = {
+                "baseUrl": patch["_strata"],
+                "models": [{"contextTokens": 32768, "maxTokens": 4096}]}
+            cfg["agents"]["defaults"]["model"] = {"primary": "strata/qwen3.8-flash-next-iq3_s"}
         else: cfg["channels"]["whatsapp"].update(patch)
         codes = [c for s, c, _ in invariants.check(cfg) if s == "error"]
         ok = (want in codes) if want else not codes

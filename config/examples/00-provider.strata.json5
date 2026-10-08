@@ -1,0 +1,44 @@
+// Strata — a local OpenAI-compatible engine, as an alternative to Ollama.
+//
+// Start Strata separately; it serves /v1 on its own port (8080 by default).
+// Two things differ from the Ollama path and both matter:
+//
+//   1. No think:false needed. Strata returns chain-of-thought in a separate
+//      `reasoning_content` field instead of mixing it into `content`, so the
+//      reasoning leak that the proxy exists to prevent cannot happen here.
+//      The proxy still drops the field outright, so a client that decides to
+//      concatenate it cannot reintroduce the leak.
+//
+//   2. The proxy is still REQUIRED. guard/gate.py runs inside it and there is
+//      no other hook for filtering model output before it reaches a channel.
+//      Pointing baseUrl at :8080 works and ships every reply ungated, with no
+//      error anywhere. guard/invariants.py fails startup if you do.
+//
+//      systemctl --user start ollama-nothink.service
+//      STRATA_UPSTREAM=http://127.0.0.1:8080   # if Strata is not on 8080
+{
+  models: {
+    providers: {
+      strata: {
+        api: "openai-completions",
+        baseUrl: "http://127.0.0.1:11435/v1",   // the gate proxy, never :8080
+        apiKey: "strata-local",
+        models: [
+          {
+            id: "qwen3.8-flash-next-iq3_s",     // must match /v1/models
+            name: "Qwen3.8 Flash Next (Strata IQ3_S)",
+            input: ["text"],
+            // Strata reports n_ctx 131072. 32k keeps per-turn prefill sane for
+            // chat; raise it if you actually need the history.
+            contextTokens: 32768,
+            // Reasoning is billed against the SAME completion budget as the
+            // answer. Too low and a long chain consumes all of it, returning
+            // empty content with finish_reason "length" and no reply at all.
+            maxTokens: 4096,
+          },
+        ],
+      },
+    },
+  },
+  agents: { defaults: { model: { primary: "strata/qwen3.8-flash-next-iq3_s" } } },
+}

@@ -26,7 +26,7 @@ GATE = os.environ.get("UNDERSTUDY_GATE", os.environ.get("SWAMAI_GATE", "1")) != 
 # Other workloads share this proxy (agentic_trading was found using it), and
 # truncating their structured JSON at 400 chars corrupts their results.
 _gm = os.environ.get("UNDERSTUDY_GATE_MODELS",
-                     os.environ.get("SWAMAI_GATE_MODELS", "qwen3.8-27b-24k,qwen3-8b-24k"))
+                     os.environ.get("SWAMAI_GATE_MODELS", "qwen3.8-27b-24k,qwen3-8b-24k,qwen3.8-flash-next-iq3_s"))
 GATE_MODELS = {m.strip() for m in _gm.split(",") if m.strip()}
 try:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
@@ -48,6 +48,11 @@ def gate_text(text):
     return text, []
 
 UPSTREAM = os.environ.get("OLLAMA_UPSTREAM", "http://127.0.0.1:11434").rstrip("/")
+# OpenAI-shaped traffic (/v1/...) goes to Strata instead. Strata is a separate
+# engine with its own wire format, and it needs no think=false: it returns
+# reasoning in a distinct `reasoning_content` field rather than mixing it into
+# `content`. Routing both shapes through one proxy keeps a single gate chokepoint.
+V1_UPSTREAM = os.environ.get("STRATA_UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
 PORT = int(os.environ.get("PORT", "11435"))
 HOP = {"connection", "keep-alive", "transfer-encoding", "upgrade",
        "proxy-authenticate", "proxy-authorization", "te", "trailers", "host"}
@@ -118,6 +123,107 @@ def apply_gate_to_body(raw, model=None, fmt=None):
     return (json.dumps(head) + "\n" + json.dumps(tail) + "\n").encode()
 
 
+def _strip_reasoning(obj):
+    """Remove reasoning_content wherever it appears.
+
+    Belt and braces. Strata keeps chain-of-thought out of `content` on its own,
+    so this is not load-bearing today — but whether reasoning reaches a group
+    chat should not depend on a downstream client choosing not to concatenate a
+    field it was handed. Dropping it here makes the leak structurally impossible.
+    """
+    changed = False
+    for ch in obj.get("choices") or []:
+        for slot in ("message", "delta"):
+            m = ch.get(slot)
+            if isinstance(m, dict) and m.pop("reasoning_content", None) is not None:
+                changed = True
+    return changed
+
+
+def apply_gate_to_openai(raw, model=None):
+    """Gate an OpenAI /v1/chat/completions response. Non-stream JSON or SSE.
+
+    Same contract as the Ollama path: tool-call rounds are machinery and pass
+    through untouched, only assistant prose bound for a human is gated.
+    """
+    if not raw:
+        return raw
+    text = raw.decode("utf-8", "replace")
+
+    # ---- non-streaming: one JSON object
+    if not text.lstrip().startswith("data:"):
+        try:
+            o = json.loads(text)
+        except Exception:
+            return raw
+        touched = _strip_reasoning(o)
+        choices = o.get("choices") or []
+        if any((c.get("message") or {}).get("tool_calls") for c in choices):
+            return json.dumps(o).encode() if touched else raw
+        for c in choices:
+            msg = c.get("message") or {}
+            content = msg.get("content") or ""
+            # Reasoning tokens are billed against the same completion budget as
+            # the answer. A long chain can exhaust max_tokens before any prose is
+            # emitted, leaving content null with finish_reason "length". Left
+            # alone, OpenClaw puts "No reply was generated for this message" into
+            # the chat; NO_REPLY makes it fail silent instead.
+            if not content.strip() and c.get("finish_reason") == "length":
+                msg["content"] = "NO_REPLY"
+                c["message"] = msg
+                touched = True
+                print("gate: truncated-before-content -> 'NO_REPLY'", flush=True)
+                continue
+            if not _gateable(model or o.get("model"), None, content):
+                continue
+            new, why = gate_text(content)
+            if why:
+                msg["content"] = new
+                c["message"] = msg
+                touched = True
+                print(f"gate: {','.join(why)} -> {new[:48]!r}", flush=True)
+        return json.dumps(o).encode() if touched else raw
+
+    # ---- streaming: SSE frames
+    frames = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            continue
+        try:
+            frames.append(json.loads(payload))
+        except Exception:
+            return raw
+    if not frames:
+        return raw
+    if any((c.get("delta") or {}).get("tool_calls")
+           for f in frames for c in (f.get("choices") or [])):
+        return raw
+
+    assembled = "".join((c.get("delta") or {}).get("content") or ""
+                        for f in frames for c in (f.get("choices") or []))
+    if not _gateable(model or frames[-1].get("model"), None, assembled):
+        return raw
+    new, why = gate_text(assembled)
+    if not why:
+        return raw
+    print(f"gate: {','.join(why)} -> {new[:48]!r}", flush=True)
+    last = frames[-1]
+    head = {"id": last.get("id"), "object": "chat.completion.chunk",
+            "created": last.get("created"), "model": last.get("model"),
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": new},
+                         "finish_reason": None}]}
+    tail = {"id": last.get("id"), "object": "chat.completion.chunk",
+            "created": last.get("created"), "model": last.get("model"),
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    return (f"data: {json.dumps(head)}\n\n"
+            f"data: {json.dumps(tail)}\n\n"
+            f"data: [DONE]\n\n").encode()
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -128,9 +234,22 @@ class H(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
 
+        path = self.path.rstrip("/")
+        is_v1_chat = path.endswith("/v1/chat/completions")
+        upstream = V1_UPSTREAM if self.path.startswith("/v1/") else UPSTREAM
+
         # Inject think=false for chat completions.
         req_model = req_format = None
-        if method == "POST" and self.path.rstrip("/").endswith("/api/chat") and body:
+        if method == "POST" and is_v1_chat and body:
+            # Strata separates reasoning itself; there is nothing to inject here.
+            # Read the model only so the gate can tell whose output this is.
+            try:
+                payload = json.loads(body)
+                if isinstance(payload, dict):
+                    req_model = payload.get("model")
+            except Exception:
+                pass
+        elif method == "POST" and path.endswith("/api/chat") and body:
             try:
                 payload = json.loads(body)
                 if isinstance(payload, dict):
@@ -144,9 +263,11 @@ class H(BaseHTTPRequestHandler):
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         headers["Content-Length"] = str(len(body))
-        req = urllib.request.Request(UPSTREAM + self.path, data=body or None,
+        req = urllib.request.Request(upstream + self.path, data=body or None,
                                      headers=headers, method=method)
-        is_chat = self.path.rstrip("/").endswith("/api/chat")
+        # Buffer anything the gate must inspect: it needs the whole reply before
+        # it can decide, so these paths cannot stream through.
+        is_chat = path.endswith("/api/chat") or is_v1_chat
         try:
             with urllib.request.urlopen(req, timeout=1800) as up:
                 raw = up.read() if is_chat else None
@@ -158,7 +279,8 @@ class H(BaseHTTPRequestHandler):
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 if is_chat:
-                    out = apply_gate_to_body(raw, req_model, req_format)
+                    out = (apply_gate_to_openai(raw, req_model) if is_v1_chat
+                           else apply_gate_to_body(raw, req_model, req_format))
                     self.wfile.write(b"%X\r\n%s\r\n" % (len(out), out))
                 else:
                     while True:
@@ -191,7 +313,7 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"ollama no-think proxy: 127.0.0.1:{PORT} -> {UPSTREAM}", flush=True)
+    print(f"understudy gate proxy: 127.0.0.1:{PORT}\n  /api/*  -> {UPSTREAM}  (ollama, think=false injected)\n  /v1/*   -> {V1_UPSTREAM}  (strata, reasoning_content dropped)", flush=True)
     try:
         ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
     except KeyboardInterrupt:

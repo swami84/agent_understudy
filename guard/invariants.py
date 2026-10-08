@@ -120,15 +120,34 @@ def check(cfg: dict) -> list[tuple[str, str, str]]:
         out.append(("warn", "block-streaming-channel",
                     "channels.whatsapp.streaming.block.enabled is not false"))
 
-    # 8. Reasoning suppression depends on the proxy, not on config.
-    base = ((cfg.get("models") or {}).get("providers") or {}).get("ollama", {}).get("baseUrl", "")
-    if base and "11435" not in base:
-        out.append(("error", "no-nothink-proxy",
-                    f"ollama baseUrl is {base!r}, not the no-think proxy on :11435 — "
-                    f"OpenClaw never sends think:false, so reasoning will be delivered"))
+    # 8. The gate proxy is the only place model output can be filtered.
+    #
+    # Checked against whichever provider is primary, not against "ollama".
+    # Pointing a local provider straight at its engine still works perfectly —
+    # replies just arrive ungated, with no error anywhere. That is how this gets
+    # lost: nothing breaks, the guard simply stops running. For Ollama the proxy
+    # also injects think:false; for Strata reasoning already arrives in a
+    # separate field, so there the proxy is purely the gate.
+    providers = (cfg.get("models") or {}).get("providers") or {}
+    primary = ((((cfg.get("agents") or {}).get("defaults") or {}).get("model")) or {}).get("primary", "")
+    pkey = primary.split("/")[0] if "/" in primary else ""
+    LOCAL = {"ollama", "strata", "ollama_oai", "llamacpp", "vllm"}
+    # Every local provider defined, not only the primary one: an unset or
+    # mistyped primary must not be able to silence this check.
+    for key in sorted(set(providers) & LOCAL):
+        base = providers.get(key, {}).get("baseUrl", "")
+        if base and "11435" not in base:
+            why = ("reasoning will be delivered into chat" if key == "ollama"
+                   else "every reply bypasses guard/gate.py")
+            out.append(("error", "no-gate-proxy",
+                        f"{key} baseUrl is {base!r}, not the gate proxy on :11435 — {why}"))
+    if pkey and pkey not in providers:
+        out.append(("error", "primary-model-missing",
+                    f"agents.defaults.model.primary is {primary!r} but no provider "
+                    f"{pkey!r} is defined"))
 
     # 9. Context must fit the system prompt with room to spare.
-    models = ((cfg.get("models") or {}).get("providers") or {}).get("ollama", {}).get("models") or []
+    models = providers.get(pkey or "ollama", {}).get("models") or []
     if models:
         ctx = models[0].get("contextTokens") or 0
         chars = sum(f.stat().st_size for f in WORKSPACE.glob("*.md")) if WORKSPACE.exists() else 0
