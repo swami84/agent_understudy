@@ -27,7 +27,6 @@
         { path: "<REPO_PATH>/corpus/people", pattern: "**/*.md" },
         { path: "<REPO_PATH>/corpus/groups", pattern: "**/*.md" },
         { path: "<REPO_PATH>/corpus/chats",  pattern: "**/*.md" },
-        { path: "<REPO_PATH>/corpus/news",   pattern: "**/*.md" },
         // Dated facts. _now.md carries today's date — without it every remembered
         // fact reads as equally current.
         { path: "<REPO_PATH>/corpus/timeline", pattern: "**/*.md" },

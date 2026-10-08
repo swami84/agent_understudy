@@ -11,7 +11,7 @@ is present, so this sits in front and adds it.
 
 Point OpenClaw at http://127.0.0.1:11435 instead of :11434.
 """
-import json, os, pathlib, sys, urllib.error, urllib.request
+import json, os, pathlib, re, sys, urllib.error, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # --- outbound gate -----------------------------------------------------------
@@ -54,6 +54,7 @@ UPSTREAM = os.environ.get("OLLAMA_UPSTREAM", "http://127.0.0.1:11434").rstrip("/
 # `content`. Routing both shapes through one proxy keeps a single gate chokepoint.
 V1_UPSTREAM = os.environ.get("STRATA_UPSTREAM", "http://127.0.0.1:8080").rstrip("/")
 PORT = int(os.environ.get("PORT", "11435"))
+DUMP = os.environ.get("UNDERSTUDY_DUMP_REQUESTS", "")
 HOP = {"connection", "keep-alive", "transfer-encoding", "upgrade",
        "proxy-authenticate", "proxy-authorization", "te", "trailers", "host"}
 
@@ -123,6 +124,137 @@ def apply_gate_to_body(raw, model=None, fmt=None):
     return (json.dumps(head) + "\n" + json.dumps(tail) + "\n").encode()
 
 
+# System prompts OpenClaw uses for its own machinery rather than for a reply.
+# Gating these is what broke compaction: a session summary is not a chat message,
+# and truncating it to 400 chars made every compaction fail with guard_blocked,
+# which in turn produced no reply at all.
+_INTERNAL_SYSTEM = (
+    "context summarization assistant",
+    "do not continue the conversation",
+    "produce a structured summary",
+)
+# The persona marker a genuine reply request carries.
+_REPLY_SYSTEM = ("openclaw:attempt:", "personal assistant running inside openclaw")
+
+
+def is_internal_request(payload):
+    """True when this call is OpenClaw talking to itself, not composing a reply.
+
+    Deliberately fail-closed: anything that does not positively look like
+    machinery stays gated. A mangled summary costs a missed reply; an ungated
+    reply puts chain-of-thought or a system prompt into someone's chat.
+    """
+    if not isinstance(payload, dict):
+        return False
+    sys_text = " ".join(
+        (m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content")))
+        or ""
+        for m in (payload.get("messages") or [])
+        if m.get("role") == "system"
+    ).lower()
+    if any(k in sys_text for k in _INTERNAL_SYSTEM):
+        return True
+    # Reply rounds carry the agent's tool catalog; summarisation rounds carry none.
+    if not (payload.get("tools") or []) and not any(k in sys_text for k in _REPLY_SYSTEM):
+        return True
+    return False
+
+
+# OpenClaw stamps each inbound message: "[Thu 2026-10-08 14:20 EDT] say OK".
+STAMP = re.compile(r"^\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s*([A-Z]{2,5})?\]")
+
+# Minutes after which an inbound message is history, not a request. 0 disables.
+STALE_AFTER_MIN = int(os.environ.get("UNDERSTUDY_STALE_MIN", "30"))
+
+
+def _last_user_text(payload):
+    for m in reversed(payload.get("messages") or []):
+        if m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    return part.get("text") or ""
+        return ""
+    return ""
+
+
+def message_age_minutes(payload, now=None):
+    """Age of the message being answered, from OpenClaw's own timestamp stamp.
+
+    Returns None when there is no stamp — do NOT treat that as stale, or every
+    untimestamped internal call would be suppressed.
+    """
+    import datetime as _dt
+    m = STAMP.match(_last_user_text(payload))
+    if not m:
+        return None
+    try:
+        when = _dt.datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    now = now or _dt.datetime.now()
+    return (now - when).total_seconds() / 60.0
+
+
+def is_stale(payload, now=None):
+    """True when this message is old enough that replying would be surprising.
+
+    WhatsApp redelivers everything missed while the gateway was down, and
+    OpenClaw replays it through the normal path. With a 237-member group live,
+    a restart after an outage would answer a backlog of messages whose authors
+    have long moved on — the shape of the 93-message incident, from a different
+    cause. There is no age cutoff anywhere in OpenClaw; this is it.
+    """
+    if STALE_AFTER_MIN <= 0:
+        return False
+    age = message_age_minutes(payload, now)
+    return age is not None and age > STALE_AFTER_MIN
+
+
+def no_reply_response(model, stream):
+    """A well-formed completion whose only content is NO_REPLY.
+
+    OpenClaw maps a bare NO_REPLY to an empty reply and delivers nothing —
+    verified end to end, status ok with zero payloads. Returning this instead of
+    forwarding means a stale message never reaches the model, so it costs no GPU
+    either.
+    """
+    if not stream:
+        return json.dumps({
+            "id": "chatcmpl-stale", "object": "chat.completion", "created": 0,
+            "model": model or "unknown",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "NO_REPLY"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }).encode()
+    head = {"id": "chatcmpl-stale", "object": "chat.completion.chunk", "created": 0,
+            "model": model or "unknown",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "NO_REPLY"},
+                         "finish_reason": None}]}
+    tail = {"id": "chatcmpl-stale", "object": "chat.completion.chunk", "created": 0,
+            "model": model or "unknown",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+    return (f"data: {json.dumps(head)}\n\n"
+            f"data: {json.dumps(tail)}\n\n"
+            f"data: [DONE]\n\n").encode()
+
+
+def suppress_thinking(payload):
+    """Turn reasoning off for a request, in place. True if it changed anything.
+
+    Strata honours chat_template_kwargs.enable_thinking; a bare top-level
+    enable_thinking is ignored and still emits a full chain of thought.
+    """
+    if "reasoning_effort" in payload or "chat_template_kwargs" in payload:
+        return False
+    payload["chat_template_kwargs"] = {"enable_thinking": False}
+    return True
+
+
 def _strip_reasoning(obj):
     """Remove reasoning_content wherever it appears.
 
@@ -140,7 +272,7 @@ def _strip_reasoning(obj):
     return changed
 
 
-def apply_gate_to_openai(raw, model=None):
+def apply_gate_to_openai(raw, model=None, internal=False):
     """Gate an OpenAI /v1/chat/completions response. Non-stream JSON or SSE.
 
     Same contract as the Ollama path: tool-call rounds are machinery and pass
@@ -149,6 +281,13 @@ def apply_gate_to_openai(raw, model=None):
     if not raw:
         return raw
     text = raw.decode("utf-8", "replace")
+    if internal:
+        # Still drop reasoning_content, but never rewrite or truncate the body.
+        try:
+            o = json.loads(text)
+            return json.dumps(o).encode() if _strip_reasoning(o) else raw
+        except Exception:
+            return raw
 
     # ---- non-streaming: one JSON object
     if not text.lstrip().startswith("data:"):
@@ -240,6 +379,7 @@ class H(BaseHTTPRequestHandler):
 
         # Inject think=false for chat completions.
         req_model = req_format = None
+        req_internal = req_stale = False
         if method == "POST" and is_v1_chat and body:
             # Strata separates reasoning itself; there is nothing to inject here.
             # Read the model only so the gate can tell whose output this is.
@@ -247,6 +387,24 @@ class H(BaseHTTPRequestHandler):
                 payload = json.loads(body)
                 if isinstance(payload, dict):
                     req_model = payload.get("model")
+                    req_internal = is_internal_request(payload)
+                    if not req_internal and is_stale(payload):
+                        req_stale = True
+                    # Every /v1 request through this proxy is the assistant.
+                    # Ingest talks to Strata directly on :8080, so nothing else
+                    # is affected. Reasoning is billed against the same
+                    # max_tokens as the answer and the gate drops
+                    # reasoning_content regardless, so on a turn with several
+                    # tool results it bought nothing and spent the whole budget:
+                    # stopReason=length, and no reply at all.
+                    if suppress_thinking(payload):
+                        # A session summary gains nothing from chain-of-thought,
+                        # but reasoning is billed against the same max_tokens as
+                        # the summary itself. On a long transcript it consumed the
+                        # whole budget and OpenClaw failed with "model returned no
+                        # summary text", which cancels compaction and ultimately
+                        # produces no reply at all.
+                        body = json.dumps(payload).encode()
             except Exception:
                 pass
         elif method == "POST" and path.endswith("/api/chat") and body:
@@ -260,6 +418,27 @@ class H(BaseHTTPRequestHandler):
                         body = json.dumps(payload).encode()
             except Exception:
                 pass  # not JSON we understand: pass through untouched
+
+        if DUMP and is_v1_chat and body:
+            try:
+                import time as _t
+                pathlib.Path(DUMP).mkdir(parents=True, exist_ok=True)
+                (pathlib.Path(DUMP) / f"req-{_t.time():.3f}.json").write_bytes(body)
+            except Exception:
+                pass
+
+        if req_stale:
+            age = message_age_minutes(json.loads(body))
+            print(f"stale: {age:.0f} min old (> {STALE_AFTER_MIN}) -> NO_REPLY", flush=True)
+            out = no_reply_response(req_model, bool(json.loads(body).get("stream")))
+            ctype = ("text/event-stream" if json.loads(body).get("stream")
+                     else "application/json")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
 
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
         headers["Content-Length"] = str(len(body))
@@ -279,7 +458,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 if is_chat:
-                    out = (apply_gate_to_openai(raw, req_model) if is_v1_chat
+                    out = (apply_gate_to_openai(raw, req_model, req_internal) if is_v1_chat
                            else apply_gate_to_body(raw, req_model, req_format))
                     self.wfile.write(b"%X\r\n%s\r\n" % (len(out), out))
                 else:

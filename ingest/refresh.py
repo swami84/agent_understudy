@@ -20,6 +20,7 @@ import argparse, json, os, pathlib, subprocess, sys, time, urllib.error, urllib.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import temporal as T
 import build_temporal as BT
+import llm
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -85,13 +86,16 @@ def main():
     ap.add_argument("--force", action="store_true", help="rebuild everything")
     ap.add_argument("--shared", action="store_true",
                     help="proceed even if another model is loaded on this GPU")
-    ap.add_argument("--model", default="qwen3.8:27b")
+    ap.add_argument("--model", default=llm.DEFAULT_MODEL)
+    ap.add_argument("--base-url", default=llm.DEFAULT_URL,
+                    help="http://127.0.0.1:11434 (ollama) or http://127.0.0.1:8080/v1 (strata)")
     ap.add_argument("--min-delta", type=int, default=25)
     ap.add_argument("--only")
     ap.add_argument("--no-index", action="store_true", help="skip the OpenClaw reindex")
     args = ap.parse_args()
 
-    common = ["--model", args.model] + (["--force"] if args.force else [])
+    common = ["--model", args.model, "--base-url", args.base_url] \
+             + (["--force"] if args.force else [])
     only = ["--only", args.only] if args.only else []
 
     # 1. Parse. Deterministic and cheap; always safe to redo.
@@ -102,6 +106,7 @@ def main():
     reparse, why = man.stale("raw", raw_hash, count=len(raws), force=args.force)
 
     print(f"\n── plan ─────────────────────────────────────────")
+    print(f"  backend      {args.base_url}")
     print(f"  exports      {len(raws)} file(s) — {'reparse (' + why + ')' if reparse else 'unchanged'}")
 
     if reparse and args.apply and raws:
@@ -115,6 +120,7 @@ def main():
     n_prof, prof_lines = would_build("build_profiles.py", common + only + ["--min-delta", str(args.min_delta)])
     n_grp, grp_lines = would_build("build_group_context.py", common + only)
     cached, uncached, n_chats = BT.plan_months(ROOT / "corpus" / "chats", args.model, args.only)
+    backend = "strata" if llm.is_openai(args.base_url) else "ollama"
     if args.force:
         uncached, cached = cached + uncached, 0
 
@@ -137,7 +143,7 @@ def main():
         return 0
 
     # 3. Preflight the shared GPU.
-    if not args.no_llm and calls:
+    if not args.no_llm and calls and not llm.is_openai(args.base_url):
         others = [m for m in resident() if m != args.model]
         if others and not args.shared:
             print(f"refusing to start: {', '.join(others)} is loaded on this GPU.", file=sys.stderr)
@@ -145,14 +151,14 @@ def main():
             return 2
 
     t0 = time.time()
-    llm = [] if not args.no_llm else ["--no-llm"]
+    llm_flag = [] if not args.no_llm else ["--no-llm"]
     if not args.no_llm:
         run([sys.executable, "ingest/build_profiles.py", *common, *only,
              "--min-delta", str(args.min_delta)])
         run([sys.executable, "ingest/build_group_context.py", *common, *only])
-    run([sys.executable, "ingest/build_temporal.py", *common, *only, *llm])
+    run([sys.executable, "ingest/build_temporal.py", *common, *only, *llm_flag])
 
-    if not args.no_llm and calls:
+    if not args.no_llm and calls and not llm.is_openai(args.base_url):
         unload(args.model)
 
     if not args.no_index:

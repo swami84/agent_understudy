@@ -96,7 +96,7 @@ with tempfile.TemporaryDirectory() as td:
                  "- **Ravi** (10:00): ride saturday?\n- **Ravi** (10:05): ok booked\n")
     calls = []
 
-    def fake(model, prompt, timeout):
+    def fake(model, prompt, timeout, base_url=None):
         calls.append(prompt)
         return {"events": [
             {"date": "2026-06-13", "who": ["Ravi"], "kind": "plan", "what": "ride on Saturday"},

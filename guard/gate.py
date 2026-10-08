@@ -17,7 +17,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import re
+import os, re
 import sys
 from dataclasses import dataclass, field
 
@@ -84,9 +84,15 @@ NARRATION = [(re.compile(p, re.I), label) for p, label in _NARRATION]
 # rules — kept as a separate named profile so the two can diverge (an
 # impersonating assistant plausibly needs *stricter* rules, e.g. refusing to
 # commit on the owner's behalf) without restructuring every call site.
+# A hard cap still exists, but as a runaway stop rather than a style rule. At 400
+# it was doing the styling: ordinary, well-formed answers were being cut
+# mid-sentence, and the chat saw a truncated reply with no indication why.
+# Brevity belongs in the prompt, where the model can end a sentence properly.
+MAX_CHARS = int(os.environ.get("UNDERSTUDY_MAX_CHARS", "1600"))
+
 PROFILES = {
-    "assistant": {"narration": _NARRATION + _LEAKS, "max_chars": 400},
-    "impersonation": {"narration": _NARRATION + _LEAKS, "max_chars": 400},
+    "assistant": {"narration": _NARRATION + _LEAKS, "max_chars": MAX_CHARS},
+    "impersonation": {"narration": _NARRATION + _LEAKS, "max_chars": MAX_CHARS},
 }
 _COMPILED = {k: [(re.compile(p, re.I), lbl) for p, lbl in v["narration"]]
              for k, v in PROFILES.items()}
@@ -124,6 +130,46 @@ class Verdict:
 
 
 ATTRIB = re.compile(r"^\s*(?:[^\w\s]{1,3}\s*)?[A-Za-z][\w ]{0,20}:\s*")
+
+
+# "<Name>:" with no emoji in front. The summon pattern must be able to tell the
+# assistant's own output from a human typing the name, and the only signal
+# available is that leading emoji — OpenClaw silently rejects any mention pattern
+# containing a literal emoji, so the pattern can only match it as \W.
+BARE_ATTRIB = re.compile(r"^\s*([A-Za-z][\w ]{0,20}):\s")
+
+
+def _assistant_name():
+    """The configured assistant name, from responsePrefix ("🤖 SwamAI:")."""
+    env = os.environ.get("UNDERSTUDY_NAME")
+    if env:
+        return env.strip()
+    try:
+        import json, pathlib as _p
+        cfg = json.loads((_p.Path.home() / ".openclaw/openclaw.json").read_text())
+        prefix = (cfg.get("channels", {}).get("whatsapp", {}) or {}).get("responsePrefix", "")
+        m = re.search(r"([A-Za-z][\w ]{0,20}):\s*$", prefix.strip())
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def normalize_attribution(text: str, name: str, emoji: str = "\U0001f916") -> str:
+    """Prepend the emoji when the assistant signs itself without one.
+
+    responsePrefix is applied by OpenClaw's own code on replies, so those always
+    carry it. Scheduled sends rely on an instruction the model can ignore, and a
+    bare "SwamAI: ..." is indistinguishable from a human writing it — which is
+    what reopens the self-reply loop.
+    """
+    if not text or not name:
+        return text
+    m = BARE_ATTRIB.match(text)
+    if m and m.group(1).strip().lower() == name.strip().lower():
+        return f"{emoji} {text.lstrip()}"
+    return text
 
 
 def _strip_attribution(line: str) -> str:
@@ -193,6 +239,16 @@ def check_message(text: str, max_chars: int | None = None,
         trimmed = cut[: len(cut) - m.start()] if m else cut.rsplit(" ", 1)[0]
         cleaned = trimmed.strip()
         reasons.append("truncated")
+
+    # Last step: a bare "<Name>: ..." is indistinguishable from a human typing it,
+    # and the summon pattern has to tell them apart. Give the assistant's own
+    # output the emoji the pattern keys on.
+    name = _assistant_name()
+    if name:
+        normalized = normalize_attribution(cleaned, name)
+        if normalized != cleaned:
+            cleaned = normalized
+            reasons.append("attribution-normalized")
 
     return Verdict("strip" if dropped or "truncated" in reasons else "send",
                    cleaned, reasons, dropped)

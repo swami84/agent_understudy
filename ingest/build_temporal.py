@@ -22,8 +22,8 @@ from datetime import date, datetime
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import temporal as T
+import llm
 
-OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
 
 PROMPT = """Extract dated facts from one month of a group chat. Output JSON only.
 
@@ -50,23 +50,9 @@ Rules:
 - At most 12 events and 6 open items. Empty lists are fine."""
 
 
-def ask_json(model, prompt, timeout):
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "think": False,
-        "format": "json",
-        "keep_alive": "5m",
-        "options": {"temperature": 0.1, "num_ctx": 32768},
-    }
-    req = urllib.request.Request(
-        OLLAMA, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        raw = json.loads(r.read())["message"]["content"].strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-    return json.loads(raw)
+def ask_json(model, prompt, timeout, base_url=None):
+    return llm.parse_json(llm.chat(prompt, model=model, base_url=base_url,
+                                   timeout=timeout, json_mode=True))
 
 
 def valid_date(s, month):
@@ -106,7 +92,8 @@ def similar(a, b, thresh=0.6):
     return len(shared) >= 2 and len(shared) / min(len(x), len(y)) >= thresh
 
 
-def extract_month(chat, month, path, members, model, timeout, sample_chars, use_llm, force):
+def extract_month(chat, month, path, members, model, timeout, sample_chars, use_llm, force,
+                  base_url=None):
     """-> dict with events/open, cached by (content, prompt version, model)."""
     msgs = T.read_month(path)
     if not msgs:
@@ -126,7 +113,7 @@ def extract_month(chat, month, path, members, model, timeout, sample_chars, use_
         start=f"{month}-01", end=T.month_end(month).isoformat(), sample=sample,
     )
     try:
-        data = ask_json(model, prompt, timeout)
+        data = ask_json(model, prompt, timeout, base_url)
     except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError) as e:
         print(f"    ! {chat} {month}: {type(e).__name__}: {e}", file=sys.stderr)
         return None, msgs, "failed"
@@ -304,7 +291,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--chats", default="corpus/chats")
     ap.add_argument("--out", default="corpus/timeline")
-    ap.add_argument("--model", default="qwen3.8:27b")
+    ap.add_argument("--model", default=llm.DEFAULT_MODEL)
+    ap.add_argument("--base-url", default=llm.DEFAULT_URL)
     ap.add_argument("--sample-chars", type=int, default=24000)
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--only")
@@ -354,7 +342,8 @@ def main():
 
         for month, path in months:
             data, msgs, how = extract_month(d.name, month, path, top, args.model,
-                                            args.timeout, args.sample_chars, use_llm, args.force)
+                                            args.timeout, args.sample_chars, use_llm, args.force,
+                                            args.base_url)
             all_msgs += msgs
             cost[how] += 1
             if data:

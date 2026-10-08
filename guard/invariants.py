@@ -26,7 +26,12 @@ BOT_SAMPLES = [
     "🤖 SwamAI: SwamAI is now set up and listening.",
     "🤖 SwamAI: I'm unable to fetch that. Ask SwamAI again later.",
     "🤖 SwamAI: Noted — 7:30 works.",
-    "SwamAI: no-emoji variant that still mentions SwamAI again",
+    # A bare "SwamAI: ..." is NOT listed here any more. It is indistinguishable
+    # from a human typing the name with a colon — a group member did exactly that and their
+    # message was dropped as "no mention detected". guard/gate.py now normalizes
+    # the assistant's own bare attribution to carry the emoji (see
+    # normalize_attribution and its test), so the pattern can key on that emoji
+    # and let humans through.
     "🤖 SwamAI: Here's a picture of a golden retriever.",
 ]
 HUMAN_SAMPLES = [

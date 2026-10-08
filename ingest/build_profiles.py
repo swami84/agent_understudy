@@ -13,8 +13,8 @@ from collections import defaultdict
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import temporal as T
+import llm
 
-OLLAMA = "http://127.0.0.1:11434/api/chat"
 BULLET = re.compile(r"^- \*\*(?P<sender>.+?)\*\* \((?P<time>\d{2}:\d{2})\): (?P<body>.*)$")
 
 SELF_PROMPT = """These are the chat owner's OWN messages — this is the user of the \
@@ -130,27 +130,17 @@ def sample(msgs, budget_chars):
     return "\n".join(picked)
 
 
-def ask(model, prompt, timeout):
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "think": False,
-        "keep_alive": "5m",
-        "options": {"temperature": 0.2, "num_ctx": 32768},
-    }
-    req = urllib.request.Request(
-        OLLAMA, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())["message"]["content"].strip()
+def ask(model, prompt, timeout, base_url=None):
+    return llm.chat(prompt, model=model, base_url=base_url, timeout=timeout)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--chats", default="corpus/chats")
     ap.add_argument("--out", default="corpus/people")
-    ap.add_argument("--model", default="qwen3.8:27b")
+    ap.add_argument("--model", default=llm.DEFAULT_MODEL)
+    ap.add_argument("--base-url", default=llm.DEFAULT_URL,
+                    help="http://127.0.0.1:11434 (ollama) or http://127.0.0.1:8080/v1 (strata)")
     ap.add_argument("--min-messages", type=int, default=30)
     ap.add_argument("--sample-chars", type=int, default=12000)
     ap.add_argument("--timeout", type=int, default=600)
@@ -214,8 +204,8 @@ def main():
             sample=sample(d["msgs"], args.sample_chars),
         )
         try:
-            body = ask(args.model, prompt, args.timeout)
-        except (urllib.error.URLError, TimeoutError, KeyError, OSError) as e:
+            body = ask(args.model, prompt, args.timeout, args.base_url)
+        except (urllib.error.URLError, TimeoutError, KeyError, OSError, ValueError) as e:
             print(f"  FAILED {name}: {e}", file=sys.stderr)
             failed += 1
             continue

@@ -209,6 +209,7 @@ diverge.
 | `guard/watchdog.py` | Runaway send loops. OpenClaw's `botLoopProtection` **does not cover WhatsApp**. |
 | `guard/invariants.py` | Config mistakes that fail silently. Wired as `ExecStartPre`. |
 | URL preflight | Invented image URLs (models hallucinate plausible ones that 404). |
+| Staleness cutoff | Replies to a backlog. WhatsApp redelivers everything missed while the gateway was down, and OpenClaw replays it through the normal path — so a restart answers messages whose authors moved on hours ago. `UNDERSTUDY_STALE_MIN` (default 30). |
 
 Read `guard/README.md` before enabling any group.
 
@@ -230,6 +231,10 @@ Things that cost real debugging time, in case they save you some:
   `agents.defaults.heartbeat`.
 - **`tools.loopDetection` defaults to false.** With it off, one trivial reply took 18
   model calls.
+- **Nothing in OpenClaw caps how old an inbound message may be.** Reconnecting after
+  an outage replays the backlog as if it were live. In a 200-person group that is a
+  burst of replies to stale threads — the shape of the loop incident, from a different
+  cause. The proxy carries the cutoff because OpenClaw exposes no inbound hook.
 - **Ollama's `/v1` OpenAI-compatible endpoint breaks tool calling** — it emits
   `tool_calls` as plain text. Use the native API.
 - **`web_fetch` blocks private IPs**, so an agent cannot reach a localhost helper.

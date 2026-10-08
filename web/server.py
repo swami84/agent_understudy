@@ -197,7 +197,12 @@ def mention_pattern_for(name):
     able to summon it).
     """
     esc = re.escape(name.strip().lower())
-    return rf"^(?!\W{{0,4}}\s*{esc}\s*:).*\b{esc}\b"
+    # \W{1,4}, not \W{0,4}: zero also excluded a HUMAN typing "SwamAI: ..." —
+    # a real message did, and was dropped as "no mention detected". Requiring
+    # at least one non-word character means only an emoji-prefixed line (the
+    # assistant's own attribution) is skipped. guard/gate.py normalizes bare
+    # "<Name>:" output to carry the emoji so that remains true.
+    return rf"^(?!\W{{1,4}}\s*{esc}\s*:).*\b{esc}\b"
 
 
 def pattern_is_self_safe(pattern, name, prefix):
@@ -464,6 +469,15 @@ class H(BaseHTTPRequestHandler):
                 entry["requireMention"] = bool(data.get("requireMention", {}).get(jid, True))
             if not gset:
                 wa.pop("groups", None)
+            # Mention SCOPE must track the enabled groups. Ticking a group here
+            # used to write groupAllowFrom and requireMention only, leaving the
+            # group with no mention pattern — so nothing could summon the
+            # assistant there and the panel reported success. Silent, and it cost
+            # a debugging session to find.
+            if allowed_jids:
+                wa["mentionPatterns"] = {"mode": "allow", "allowIn": allowed_jids}
+            else:
+                wa.pop("mentionPatterns", None)
             ok, msg = save_cfg(cfg)
             return self._send(200 if ok else 400, json.dumps({"ok": ok, "message": msg}))
 

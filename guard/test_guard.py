@@ -85,12 +85,51 @@ def run():
         if not ok:
             fails.append(("good", t)); print(f"        -> {v.reasons} {v.text[:70]!r}")
 
+    print("\n── attribution normalization (keeps humans summonable) ──")
+    from guard.gate import normalize_attribution
+    import re as _re, importlib.util as _il
+    _spec = _il.spec_from_file_location("_srv", "web/server.py")
+    _srv = _il.module_from_spec(_spec); _spec.loader.exec_module(_srv)
+    rx = _re.compile(_srv.mention_pattern_for("SwamAI"), _re.I)
+    cases = [
+        ("human types 'SwamAI: ...'", "SwamAI: Who's leading, Abdul or Mike?", True),
+        ("human, no colon",           "SwamAI who is leading?",                True),
+        ("human, mid-sentence",       "hey swamai can you check",              True),
+        ("bot, emoji prefix",         "\U0001f916 SwamAI: Here are the headlines.", False),
+    ]
+    for label, text, want in cases:
+        got = bool(rx.search(text))
+        print(f"  {'PASS' if got == want else 'FAIL'}  {label:28} summons={got}")
+        if got != want: fails.append(("mention", label))
+
+    bare = "SwamAI: a scheduled send with no emoji that says SwamAI again"
+    fixed = normalize_attribution(bare, "SwamAI")
+    ok = fixed.startswith("\U0001f916 ") and not rx.search(fixed)
+    print(f"  {'PASS' if ok else 'FAIL'}  bot's bare attribution is normalized, cannot self-trigger")
+    if not ok: fails.append(("mention", "normalize"))
+
+    v = check_message(bare)
+    ok = v.text.startswith("\U0001f916 ") and "attribution-normalized" in v.reasons
+    print(f"  {'PASS' if ok else 'FAIL'}  normalization runs inside check_message")
+    if not ok: fails.append(("mention", "check_message-normalize"))
+
     print("\n── length cap ──")
-    long = "🤖 SwamAI: " + ("This is a normal sentence about tennis. " * 30)
+    # Bound to the configured cap, not a literal: the cap is a runaway stop and
+    # its value is tuned in one place. A hard-coded 400 here passed while the
+    # real limit silently moved.
+    from guard.gate import MAX_CHARS
+    reps = (MAX_CHARS // 40) + 10
+    long = "🤖 SwamAI: " + ("This is a normal sentence about tennis. " * reps)
     v = check_message(long)
-    ok = len(v.text) <= 400 and "truncated" in v.reasons
-    print(f"  {'PASS' if ok else 'FAIL'}  {len(long)} chars -> {len(v.text)}")
+    ok = len(v.text) <= MAX_CHARS and "truncated" in v.reasons
+    print(f"  {'PASS' if ok else 'FAIL'}  {len(long)} chars -> {len(v.text)} (cap {MAX_CHARS})")
     if not ok: fails.append(("len", "cap"))
+
+    under = "🤖 SwamAI: " + ("Short answer about tennis. " * 8)
+    v = check_message(under)
+    ok = "truncated" not in v.reasons and v.action == "send"
+    print(f"  {'PASS' if ok else 'FAIL'}  {len(under)} chars passes untouched")
+    if not ok: fails.append(("len", "under-cap"))
 
     print("\n── config invariants catch the real misconfigurations ──")
     base = {
