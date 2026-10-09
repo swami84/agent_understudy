@@ -96,6 +96,13 @@ def run():
         ("human, no colon",           "SwamAI who is leading?",                True),
         ("human, mid-sentence",       "hey swamai can you check",              True),
         ("bot, emoji prefix",         "\U0001f916 SwamAI: Here are the headlines.", False),
+        # "." does not cross a newline. A real message naming the assistant in
+        # its third paragraph was logged "no mention detected" and ignored.
+        ("name on a later line",
+         "Another small idea, if this can be localised and secure.\n\n"
+         "Is there a way that I can ask SwamAI for this info?", True),
+        ("bot multi-line still ignored",
+         "\U0001f916 SwamAI: first line\nand swamai mentioned again later", False),
     ]
     for label, text, want in cases:
         got = bool(rx.search(text))
@@ -112,6 +119,32 @@ def run():
     ok = v.text.startswith("\U0001f916 ") and "attribution-normalized" in v.reasons
     print(f"  {'PASS' if ok else 'FAIL'}  normalization runs inside check_message")
     if not ok: fails.append(("mention", "check_message-normalize"))
+
+    print("\n── watchdog tells a loop from a busy thread ──")
+    import importlib.util as _il2
+    _sp = _il2.spec_from_file_location("_wd", "guard/watchdog.py")
+    wd = _il2.module_from_spec(_sp); _sp.loader.exec_module(wd)
+
+    busy = [wd._norm(t) for t in [
+        "You caught me red-handed Ravi, I searched the archives twice and found nothing",
+        "Declined Ravi, that comparison is a banned meme in diplomatic circles",
+        "Glad you found it funny Meera, note the distinction in the two-defendant case",
+        "The Daadru joke Priya, full chain of custody from the first floor ceiling",
+        "Correction accepted Ravi, the record now reads differently",
+    ]]
+    looped = [wd._norm("Noted, 7:30 works for me tonight.")] * 5
+
+    cases = [
+        ("5 distinct replies do not trip", wd.verdict(5, wd.max_repeats(busy))[0], False),
+        ("7 distinct replies do not trip", wd.verdict(7, wd.max_repeats(busy))[0], False),
+        ("5 identical replies trip",       wd.verdict(5, wd.max_repeats(looped))[0], True),
+        ("runaway volume trips anyway",    wd.verdict(wd.HARD_MAX, 1)[0], True),
+    ]
+    for label, got, want in cases:
+        print(f"  {'PASS' if got == want else 'FAIL'}  {label}")
+        if got != want: fails.append(("watchdog", label))
+
+    print(f"  info  distinct={wd.max_repeats(busy)} identical={wd.max_repeats(looped)}")
 
     print("\n── length cap ──")
     # Bound to the configured cap, not a literal: the cap is a runaway stop and

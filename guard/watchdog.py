@@ -27,19 +27,48 @@ def _node_bin():
 
 WINDOW_MIN = int(os.environ.get("GUARD_WINDOW_MIN", "10"))
 MAX_PER_RECIPIENT = int(os.environ.get("GUARD_MAX", "6"))
+# A loop repeats itself; a busy group does not. Counting volume alone cannot tell
+# them apart, and it shut down a 237-member group mid-conversation over five
+# distinct, correct replies to three different people. Trip on repetition, or on
+# a volume so high no human exchange explains it.
+REPEAT_MAX = int(os.environ.get("GUARD_REPEAT_MAX", "3"))
+HARD_MAX = int(os.environ.get("GUARD_HARD_MAX", "20"))
 CFG = pathlib.Path.home() / ".openclaw/openclaw.json"
 STATE = pathlib.Path(__file__).parent / "tripped.json"
 NVM = _node_bin()
 SENT = re.compile(r"Sent message \S+ -> (\S+)")
 
 
+def _norm(text):
+    """Normalise a reply for comparison: lowercase word tokens only."""
+    return tuple(re.findall(r"[a-z0-9]{3,}", (text or "").lower()))[:40]
+
+
+def _similar(a, b, thresh=0.8):
+    x, y = set(a), set(b)
+    if not x or not y:
+        return False
+    return len(x & y) / min(len(x), len(y)) >= thresh
+
+
+def max_repeats(bodies):
+    """Largest group of near-identical replies. 1 means everything was distinct."""
+    best = 0
+    for i, a in enumerate(bodies):
+        n = sum(1 for b in bodies[i:] if _similar(a, b))
+        best = max(best, n)
+    return best
+
+
 def recent_sends(window_min):
     logs = sorted(pathlib.Path("/tmp/openclaw").glob("openclaw-*.log"),
                   key=lambda p: p.stat().st_mtime, reverse=True)
     if not logs:
-        return {}
+        return {}, {}
     cutoff = time.time() - window_min * 60
+    pending = []
     counts = defaultdict(int)
+    bodies = defaultdict(list)
     for line in logs[0].read_text(errors="replace").splitlines()[-6000:]:
         if "Sent message" not in line:
             continue
@@ -55,10 +84,14 @@ def recent_sends(window_min):
             continue
         if secs < cutoff:
             continue
-        m = SENT.search(str(d.get("message", "")))
+        msg = str(d.get("message", ""))
+        m = SENT.search(msg)
         if m:
             counts[m.group(1)] += 1
-    return dict(counts)
+            pending.append(m.group(1))
+        elif "Reply body:" in msg and pending:
+            bodies[pending[-1]].append(_norm(msg.split("Reply body:", 1)[1][:400]))
+    return dict(counts), {k: v for k, v in bodies.items()}
 
 
 def trip(recipient, n):
@@ -80,27 +113,43 @@ def trip(recipient, n):
     return True
 
 
+def verdict(n, repeats):
+    """-> (should_trip, reason). Volume alone is not evidence of a loop."""
+    if repeats >= REPEAT_MAX:
+        return True, f"{repeats} near-identical replies"
+    if n >= HARD_MAX:
+        return True, f"{n} sends, beyond any plausible exchange"
+    return False, ""
+
+
 def main():
     dry = "--dry-run" in sys.argv
-    counts = recent_sends(WINDOW_MIN)
+    counts, bodies = recent_sends(WINDOW_MIN)
     if "--status" in sys.argv:
-        print(f"sends per recipient in last {WINDOW_MIN} min (limit {MAX_PER_RECIPIENT}):")
-        for r, n in sorted(counts.items(), key=lambda kv: -kv[1]) or [("(none)", 0)]:
-            flag = "  <-- OVER" if n > MAX_PER_RECIPIENT else ""
-            print(f"  {n:>3}  {r}{flag}")
+        print(f"sends per recipient in last {WINDOW_MIN} min "
+              f"(repeat limit {REPEAT_MAX}, hard limit {HARD_MAX}):")
+        rows = sorted(counts.items(), key=lambda kv: -kv[1]) or [("(none)", 0)]
+        for r, n in rows:
+            rep = max_repeats(bodies.get(r, []))
+            trip_now, why = verdict(n, rep)
+            flag = f"  <-- WOULD TRIP: {why}" if trip_now else ""
+            print(f"  {n:>3} sends, max {rep} alike  {r}{flag}")
         if STATE.exists():
             print("\nlast trip:", STATE.read_text())
         return 0
     for recipient, n in counts.items():
-        if n > MAX_PER_RECIPIENT:
-            if dry:
-                print(f"WOULD TRIP: {n} sends to {recipient} in {WINDOW_MIN} min "
-                      f"(limit {MAX_PER_RECIPIENT}) — dry run, config untouched")
-                return 1
-            if trip(recipient, n):
-                print(f"TRIPPED: {n} sends to {recipient} in {WINDOW_MIN} min "
-                      f"(limit {MAX_PER_RECIPIENT}). Group traffic disabled.")
+        repeats = max_repeats(bodies.get(recipient, []))
+        trip_now, why = verdict(n, repeats)
+        if not trip_now:
+            continue
+        if dry:
+            print(f"WOULD TRIP: {recipient} — {why} in {WINDOW_MIN} min "
+                  f"— dry run, config untouched")
             return 1
+        if trip(recipient, n):
+            print(f"TRIPPED: {recipient} — {why} in {WINDOW_MIN} min. "
+                  f"Group traffic disabled.")
+        return 1
     return 0
 
 

@@ -202,7 +202,11 @@ def mention_pattern_for(name):
     # at least one non-word character means only an emoji-prefixed line (the
     # assistant's own attribution) is skipped. guard/gate.py normalizes bare
     # "<Name>:" output to carry the emoji so that remains true.
-    return rf"^(?!\W{{1,4}}\s*{esc}\s*:).*\b{esc}\b"
+    # [\s\S]* rather than .* — "." does not cross a newline, so a multi-line
+    # message only matched when the name appeared on the FIRST line. A real
+    # message naming the assistant in its third paragraph was logged as
+    # "no mention detected" and silently ignored.
+    return rf"^(?!\W{{1,4}}\s*{esc}\s*:)[\s\S]*\b{esc}\b"
 
 
 def pattern_is_self_safe(pattern, name, prefix):

@@ -158,6 +158,81 @@ sse = P.no_reply_response(M, True).decode()
 ck("streaming suppression ends properly",
    "NO_REPLY" in sse and sse.rstrip().endswith("[DONE]"))
 
+
+
+# ------------------------------------------------- summon enforcement (groups)
+print("\ngroup messages must name the assistant")
+os.environ["UNDERSTUDY_NAME"] = "SwamAI"
+import importlib
+importlib.reload(P)
+
+CTX = '⟦openclaw:ctx⟧\n```json\n{"sender":{"id":"+15551234567","name":"Example Member"}}\n```'
+RUNTIME = ('OpenClaw runtime context for the active user request in this turn.\n'
+           '<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nConversation info: ⟦openclaw:ctx⟧\n'
+           '```json\n{"chat_id":"%s","group_subject":"NIT-T"}\n```\n'
+           '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>')
+
+
+def turn(body, chat_id="120363000000000000@g.us", stamp="[Fri 2026-10-09 10:18 EDT]"):
+    """Mirrors a real channel turn: stamped message, then the runtime block."""
+    return {"model": M, "tools": [{"type": "function"}] * 5, "messages": [
+        {"role": "system", "content": "<!-- openclaw:attempt:STABLE --> You are a personal "
+                                      "assistant running inside OpenClaw."},
+        {"role": "user", "content": f"{stamp} Conversation info: {CTX}  {body}"},
+        {"role": "user", "content": RUNTIME % chat_id}]}
+
+summoned = turn("SwamAI give top 10 contributors with message count.")
+quiet    = turn("Don’t know man. Making it safe for myself when he grows a conscience.")
+dm       = turn("Don’t know man.", chat_id="+19787959422")
+
+ck("the runtime block is not mistaken for the message",
+   P.active_message_body(summoned).startswith("SwamAI give top 10"),
+   repr(P.active_message_body(summoned))[:80])
+ck("chat_id is read from the runtime block",
+   P.openclaw_ctx(summoned).get("chat_id") == "120363000000000000@g.us")
+ck("named in a group -> answered", P.needs_summon(summoned) is False)
+ck("unnamed in a group -> suppressed", P.needs_summon(quiet) is True)
+ck("unnamed in a DM -> still answered", P.needs_summon(dm) is False)
+ck("name match is case-insensitive",
+   P.needs_summon(turn("hey swamai what's up")) is False)
+ck("a substring is not a summon",
+   P.needs_summon(turn("that swamaiish thing")) is True)
+
+# Replying to the assistant quotes its message; that quote must not count.
+ck("a quoted bot reply is NOT a summon",
+   P.needs_summon(turn("\U0001f916 SwamAI: earlier answer here\nDon\u2019t know man, "
+                       "making it safe for myself")) is True)
+ck("a human typing 'SwamAI:' IS a summon",
+   P.needs_summon(turn("SwamAI: who is coming tonight?")) is False)
+ck("quote plus a real summon still answers",
+   P.needs_summon(turn("\U0001f916 SwamAI: earlier answer\nSwamAI what about Tuesday?")) is False)
+
+# Staleness must read the stamped message, not the unstamped runtime block.
+old_turn = turn("SwamAI ping", stamp="[Wed 2026-10-07 09:12 EDT]")
+ck("staleness reads the stamped message, not the runtime block",
+   P.message_age_minutes(old_turn, NOW) is not None)
+ck("an old real-shaped turn is stale", P.is_stale(old_turn, NOW) is True)
+ck("a fresh real-shaped turn is not",
+   P.is_stale(turn("SwamAI ping", stamp="[Thu 2026-10-08 14:18 EDT]"), NOW) is False)
+
+
+
+print("\nsampling is applied to replies, not to internal calls")
+reply_p = {"model": M, "tools": [{"type": "function"}] * 5, "messages": [
+    {"role": "system", "content": "<!-- openclaw:attempt:STABLE --> personal assistant "
+                                  "running inside OpenClaw"}]}
+P.apply_sampling(reply_p)
+ck("temperature set on a reply", reply_p.get("temperature") == float(P.TEMPERATURE))
+ck("top_p set on a reply", reply_p.get("top_p") == float(P.TOP_P))
+
+caller = {"model": M, "temperature": 0.1, "messages": []}
+P.apply_sampling(caller)
+ck("an explicit temperature is respected", caller["temperature"] == 0.1)
+
+compact_p = {"model": M, "messages": [
+    {"role": "system", "content": "You are a context summarization assistant."}]}
+ck("compaction is still classed internal", P.is_internal_request(compact_p) is True)
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {', '.join(fails)}")

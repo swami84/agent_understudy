@@ -21,6 +21,7 @@ config/*.txt
 
 # ── guard state ──
 guard/tripped.json
+guard/tripped.json.last
 
 # ── secrets ──
 .env

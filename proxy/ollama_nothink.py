@@ -167,19 +167,59 @@ STAMP = re.compile(r"^\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{4}-\d{2}-\d{2})
 STALE_AFTER_MIN = int(os.environ.get("UNDERSTUDY_STALE_MIN", "30"))
 
 
+CTX_JSON = re.compile(r"\u27e6openclaw:ctx\u27e7\s*```json\s*(\{.*?\})\s*```", re.S)
+
+
+def _text_of(m):
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(p.get("text", "") for p in c
+                        if isinstance(p, dict) and p.get("type") == "text")
+    return ""
+
+
 def _last_user_text(payload):
-    for m in reversed(payload.get("messages") or []):
+    """The newest user message that carries OpenClaw's timestamp stamp.
+
+    NOT simply the last user message. On a real channel turn OpenClaw appends a
+    large unstamped runtime-context block as the final user message, so taking
+    the last one found no stamp and every real message read as "not stale" —
+    the guard was inert on exactly the traffic it was built for.
+    """
+    msgs = payload.get("messages") or []
+    for m in reversed(msgs):
         if m.get("role") != "user":
             continue
-        c = m.get("content")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            for part in c:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    return part.get("text") or ""
-        return ""
+        t = _text_of(m)
+        if STAMP.match(t):
+            return t
     return ""
+
+
+def openclaw_ctx(payload):
+    """Merged ⟦openclaw:ctx⟧ JSON blocks: chat_id, sender, group_subject, ..."""
+    out = {}
+    for m in payload.get("messages") or []:
+        if m.get("role") != "user":
+            continue
+        for blob in CTX_JSON.findall(_text_of(m)):
+            try:
+                out.update(json.loads(blob))
+            except Exception:
+                pass
+    return out
+
+
+def active_message_body(payload):
+    """The human's actual words, with stamp and ctx block stripped."""
+    t = _last_user_text(payload)
+    if not t:
+        return ""
+    t = STAMP.sub("", t, count=1)
+    t = CTX_JSON.sub("", t, count=1)
+    return t.replace("Conversation info:", "", 1).strip()
 
 
 def message_age_minutes(payload, now=None):
@@ -215,6 +255,53 @@ def is_stale(payload, now=None):
     return age is not None and age > STALE_AFTER_MIN
 
 
+# Require the summon word in group messages. 0/empty disables.
+SUMMON_NAME = os.environ.get("UNDERSTUDY_NAME", "")
+REQUIRE_SUMMON = os.environ.get("UNDERSTUDY_REQUIRE_SUMMON", "1") != "0"
+
+
+def _summon_name():
+    if SUMMON_NAME:
+        return SUMMON_NAME.strip()
+    try:
+        from guard.gate import _assistant_name
+        return _assistant_name()
+    except Exception:
+        return ""
+
+
+def needs_summon(payload):
+    """True when this is a group message that never named the assistant.
+
+    OpenClaw counts a reply to one of the bot's own messages as an implicit
+    mention ("quoted_bot") and bypasses requireMention. That is reasonable where
+    the bot has its own identity, but this assistant runs on the OWNER's number,
+    so `self` is the owner: any reply to anything the owner posts summons it.
+    The behaviour is hardcoded in the WhatsApp plugin — `implicitMentions` is a
+    Mattermost setting and the key is rejected here — so the check lives at the
+    one chokepoint every reply passes through.
+    """
+    if not REQUIRE_SUMMON:
+        return False
+    name = _summon_name()
+    if not name:
+        return False
+    ctx = openclaw_ctx(payload)
+    chat_id = str(ctx.get("chat_id") or "")
+    if not chat_id.endswith("@g.us"):
+        return False                      # DMs never need the summon word
+    body = active_message_body(payload)
+    if not body:
+        return False                      # nothing parsed: do not suppress blindly
+    # Replying to the assistant quotes its own message, and that quote carries
+    # "<emoji> Name:". Left in, the quote would satisfy this check and a reply
+    # would still count as a summon — the exact case being fixed. Drop the
+    # assistant's attribution, using the same emoji rule as the mention pattern
+    # so a human typing "Name: ..." (no emoji) still counts.
+    body = re.sub(rf"\W{{1,4}}\s*{re.escape(name)}\s*:", " ", body, flags=re.I)
+    return not re.search(rf"\b{re.escape(name)}\b", body, re.I)
+
+
 def no_reply_response(model, stream):
     """A well-formed completion whose only content is NO_REPLY.
 
@@ -241,6 +328,30 @@ def no_reply_response(model, stream):
     return (f"data: {json.dumps(head)}\n\n"
             f"data: {json.dumps(tail)}\n\n"
             f"data: [DONE]\n\n").encode()
+
+
+# Sampling for assistant replies. OpenClaw's openai-completions provider does not
+# forward models[].params — verified by capturing the outgoing request, where
+# temperature, top_p and max_tokens all arrived as null — so the engine fell back
+# to --greedy (argmax). That is why a looping reply once repeated verbatim.
+TEMPERATURE = os.environ.get("UNDERSTUDY_TEMPERATURE", "0.7")
+TOP_P = os.environ.get("UNDERSTUDY_TOP_P", "0.8")
+
+
+def apply_sampling(payload):
+    """Set sampling on a reply request, in place. True if it changed anything.
+
+    Never applied to internal calls: compaction and summarisation want the
+    deterministic default, not creative variation.
+    """
+    changed = False
+    if TEMPERATURE and "temperature" not in payload:
+        payload["temperature"] = float(TEMPERATURE)
+        changed = True
+    if TOP_P and "top_p" not in payload:
+        payload["top_p"] = float(TOP_P)
+        changed = True
+    return changed
 
 
 def suppress_thinking(payload):
@@ -389,7 +500,9 @@ class H(BaseHTTPRequestHandler):
                     req_model = payload.get("model")
                     req_internal = is_internal_request(payload)
                     if not req_internal and is_stale(payload):
-                        req_stale = True
+                        req_stale = "stale"
+                    elif not req_internal and needs_summon(payload):
+                        req_stale = "unsummoned"
                     # Every /v1 request through this proxy is the assistant.
                     # Ingest talks to Strata directly on :8080, so nothing else
                     # is affected. Reasoning is billed against the same
@@ -397,7 +510,9 @@ class H(BaseHTTPRequestHandler):
                     # reasoning_content regardless, so on a turn with several
                     # tool results it bought nothing and spent the whole budget:
                     # stopReason=length, and no reply at all.
-                    if suppress_thinking(payload):
+                    if not req_internal:
+                        apply_sampling(payload)
+                    if suppress_thinking(payload) or not req_internal:
                         # A session summary gains nothing from chain-of-thought,
                         # but reasoning is billed against the same max_tokens as
                         # the summary itself. On a long transcript it consumed the
@@ -428,8 +543,13 @@ class H(BaseHTTPRequestHandler):
                 pass
 
         if req_stale:
-            age = message_age_minutes(json.loads(body))
-            print(f"stale: {age:.0f} min old (> {STALE_AFTER_MIN}) -> NO_REPLY", flush=True)
+            if req_stale == "stale":
+                age = message_age_minutes(json.loads(body))
+                print(f"stale: {age:.0f} min old (> {STALE_AFTER_MIN}) -> NO_REPLY", flush=True)
+            else:
+                snippet = active_message_body(json.loads(body))[:60]
+                print(f"unsummoned: group message without "
+                      f"{_summon_name()!r} -> NO_REPLY  {snippet!r}", flush=True)
             out = no_reply_response(req_model, bool(json.loads(body).get("stream")))
             ctype = ("text/event-stream" if json.loads(body).get("stream")
                      else "application/json")
