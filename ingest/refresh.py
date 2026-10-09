@@ -157,6 +157,8 @@ def main():
              "--min-delta", str(args.min_delta)])
         run([sys.executable, "ingest/build_group_context.py", *common, *only])
     run([sys.executable, "ingest/build_temporal.py", *common, *only, *llm_flag])
+    if not args.no_llm:
+        run([sys.executable, "ingest/build_locations.py", *common, *only])
 
     if not args.no_llm and calls and not llm.is_openai(args.base_url):
         unload(args.model)

@@ -115,6 +115,29 @@ python3 ingest/build_temporal.py --no-llm    # deterministic only, no GPU
 python3 ingest/test_temporal.py              # offline, no model, no network
 ```
 
+## Where people are based
+
+Retrieval over raw chats cannot answer "I'm travelling to Bangalore, who lives
+there?" — the evidence is scattered across years, phrased obliquely ("landed in
+Bangalore", "back in Dubai"), and a top-k search for a city returns whoever said
+its name most, not who lives there. So the inference happens once, at build time,
+into one card grouped by place: cities are the retrieval key, people are the
+payload.
+
+```bash
+python3 ingest/build_locations.py --dry-run     # who has usable evidence
+python3 ingest/build_locations.py               # writes corpus/locations.md
+```
+
+Two rules it encodes. **People move**, so every claim carries the date of its
+newest supporting message and anything older than 30 months is marked as such.
+**Absence is not evidence** — a person with no location signal is listed as
+unknown rather than guessed at from a timezone, a name or a cricket team. A wrong
+city is worse than none when someone travels on it.
+
+City aliases are merged (Bengaluru/Bangalore, Trichy/Tiruchirappalli), or the
+directory splits a city across two headings and finds half the people.
+
 ## Incremental refresh
 
 A full rebuild reads every message with a 27B and takes hours; almost none of that work

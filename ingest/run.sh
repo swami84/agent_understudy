@@ -22,16 +22,16 @@ if [ ${#FILES[@]} -eq 0 ]; then
   exit 1
 fi
 
-echo "── 1/6  parsing ${#FILES[@]} export(s) ──"
+echo "── 1/7  parsing ${#FILES[@]} export(s) ──"
 python3 ingest/parse_export.py "${FILES[@]}"
 
-echo "── 2/6  building profile cards (local GPU, slow) ──"
+echo "── 2/7  building profile cards (local GPU, slow) ──"
 python3 ingest/build_profiles.py --min-messages "$MIN_MSGS"
 
-echo "── 3/6  building group context cards ──"
+echo "── 3/7  building group context cards ──"
 python3 ingest/build_group_context.py
 
-echo "── 4/6  applying contact names ──"
+echo "── 4/7  applying contact names ──"
 CONTACTS=(corpus/raw/*.vcf corpus/raw/*.csv)
 if [ ${#CONTACTS[@]} -gt 0 ]; then
   python3 ingest/import_contacts.py "${CONTACTS[@]}" --apply || true
@@ -39,10 +39,13 @@ else
   echo "  (no address book in corpus/raw/ — skipping)"
 fi
 
-echo "── 5/6  building dated timelines ──"
+echo "── 5/7  building dated timelines ──"
 python3 ingest/build_temporal.py
 
-echo "── 6/6  reindexing ──"
+echo "── 6/7  building the where-people-are-based directory ──"
+python3 ingest/build_locations.py
+
+echo "── 7/7  reindexing ──"
 openclaw memory index --force --agent main
 
 echo
