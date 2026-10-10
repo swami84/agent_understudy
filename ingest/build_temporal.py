@@ -373,18 +373,21 @@ def main():
 
         for e in events:
             for w in e["who"]:
-                person_events[w].append({**e, "chat": d.name})
+                person_events[(d.name, w)].append({**e, "chat": d.name})
         for m in all_msgs:
-            person_msgs[m[1]].append(m)
-            person_chats[m[1]][d.name] += 1
+            person_msgs[(d.name, m[1])].append(m)
+            person_chats[(d.name, m[1])][d.name] += 1
 
-    for person, msgs in sorted(person_msgs.items(), key=lambda kv: -len(kv[1])):
+    # Per group, same reason as the profile cards: retrieval scopes by agent, not
+    # by conversation, so a merged timeline leaks one group's events into another.
+    for (chat, person), msgs in sorted(person_msgs.items(), key=lambda kv: -len(kv[1])):
         if len(msgs) < args.min_messages:
             continue
-        ev = sorted(person_events.get(person, []), key=lambda e: e["date"])
+        ev = sorted(person_events.get((chat, person), []), key=lambda e: e["date"])
         extra = ["**Seen in:** " + ", ".join(
-            f"{c} ({n})" for c, n in person_chats[person].most_common())]
-        dest = outdir / "people" / f"{T.slug(person)}-timeline.md"
+            f"{c} ({n})" for c, n in person_chats[(chat, person)].most_common())]
+        dest = outdir / "people" / chat / f"{T.slug(person)}-timeline.md"
+        dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(
             render(person, "person", T.stats(msgs, today), ev, [], today, extra),
             encoding="utf-8")

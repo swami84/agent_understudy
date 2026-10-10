@@ -337,6 +337,7 @@ TURN_WINDOW_SEC = int(os.environ.get("UNDERSTUDY_TURN_WINDOW", "240"))
 OBSERVE_TOOLS = os.environ.get("UNDERSTUDY_OBSERVE_TOOLS", "") == "1"
 _SEEN = {}
 _ANSWERED = set()
+_SUPPRESSED = {}
 
 
 def already_answered(payload, now=None):
@@ -638,7 +639,15 @@ class H(BaseHTTPRequestHandler):
                     req_model = payload.get("model")
                     req_internal = is_internal_request(payload)
                     req_turn = str(openclaw_ctx(payload).get("message_id") or "")
-                    if not req_internal and is_stale(payload):
+                    # A suppression must survive the retry. OpenClaw sees the
+                    # NO_REPLY as an empty response and retries; the retry prompt
+                    # is machinery, so it is exempt from the summon check, and the
+                    # model answers a message we had deliberately refused. Every
+                    # deliberate block was being laundered this way.
+                    if req_turn and req_turn in _SUPPRESSED:
+                        req_internal = False
+                        req_stale = _SUPPRESSED[req_turn]
+                    elif not req_internal and is_stale(payload):
                         req_stale = "stale"
                     elif not req_internal and already_answered(payload):
                         req_stale = "redelivered"
@@ -684,6 +693,10 @@ class H(BaseHTTPRequestHandler):
                 pass
 
         if req_stale:
+            if req_turn:
+                if len(_SUPPRESSED) > 2000:
+                    _SUPPRESSED.clear()
+                _SUPPRESSED[req_turn] = req_stale
             if req_stale == "stale":
                 age = message_age_minutes(json.loads(body))
                 print(f"stale: {age:.0f} min old (> {STALE_AFTER_MIN}) -> NO_REPLY", flush=True)

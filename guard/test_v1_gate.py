@@ -351,6 +351,37 @@ ck("no message_id means no capping", P.cap_sends(resp("message"), "") is False)
 P.MAX_SENDS_PER_TURN = 0
 P._SENDS.clear()
 
+
+
+print("\na suppression survives OpenClaw's retry")
+P._SEEN.clear(); P._ANSWERED.clear(); P._SUPPRESSED.clear()
+RT_S = ('<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n⟦openclaw:ctx⟧\n```json\n'
+        '{"chat_id":"120363000000000000@g.us","message_id":"WTF1"}\n```\n<<<END>>>')
+
+
+def msg(body):
+    return {"model": M, "tools": [{"type": "function"}] * 5, "messages": [
+        {"role": "system", "content": "<!-- openclaw:attempt:STABLE --> personal assistant "
+                                      "running inside OpenClaw"},
+        {"role": "user", "content": f"[Sat 2026-10-10 13:56 EDT] {body}"},
+        {"role": "user", "content": RT_S}]}
+
+quoted = msg("\U0001f916 SwamAI: wtf\n\n[Replying to 19847194931333@lid id:AC1]\n"
+             "\U0001f916 SwamAI: an earlier answer\n[/Replying]")
+ck("a quote-only reply is suppressed", P.needs_summon(quoted) is True)
+
+# OpenClaw reads NO_REPLY as empty and retries with its own prompt. That prompt is
+# machinery, so it is exempt from the summon check — the retry must still be
+# refused, or every deliberate block is laundered through it.
+P._SUPPRESSED["WTF1"] = "unsummoned"
+retry = msg("The previous attempt did not produce a user-visible answer. Try again.")
+ck("the retry prompt alone reads as machinery", P.is_internal_request(retry) is True)
+ck("but its message_id is already suppressed", "WTF1" in P._SUPPRESSED)
+
+P._SUPPRESSED.clear()
+ck("an unrelated message is unaffected", "WTF1" not in P._SUPPRESSED)
+P._SEEN.clear(); P._ANSWERED.clear()
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {', '.join(fails)}")

@@ -96,8 +96,15 @@ def slug(s):
     return re.sub(r"[\s_-]+", "-", s)[:60] or "person"
 
 
-def collect(chats_dir):
-    """-> {person: {"chats": set, "msgs": [(chat, month, text)]}}"""
+def collect(chats_dir, per_group=True):
+    """-> {(chat, person): {"chats": set, "msgs": [(chat, month, text)]}}
+
+    Keyed by GROUP AND PERSON, not person alone. A merged card is built from
+    every group someone appears in, so retrieving it in one group surfaces what
+    they said in another — and OpenClaw's memory search scopes by agent, never by
+    conversation, so the only way to keep groups apart is to keep their cards in
+    separate directories. per_group=False restores the old merged behaviour.
+    """
     people = defaultdict(lambda: {"chats": set(), "msgs": []})
     for md in sorted(pathlib.Path(chats_dir).rglob("*.md")):
         chat = md.parent.name
@@ -110,8 +117,9 @@ def collect(chats_dir):
             if not body or body == "[media]":
                 continue
             sender = m.group("sender").strip()
-            people[sender]["chats"].add(chat)
-            people[sender]["msgs"].append((chat, month, body))
+            key = (chat, sender) if per_group else ("", sender)
+            people[key]["chats"].add(chat)
+            people[key]["msgs"].append((chat, month, body))
     return people
 
 
@@ -151,18 +159,21 @@ def main():
     ap.add_argument("--max-age-days", type=int, default=90,
                     help="refresh a changed card at least this often")
     ap.add_argument("--dry-run", action="store_true", help="list who would be built")
+    ap.add_argument("--merged", action="store_true",
+                    help="one card per person across all groups (pre-isolation behaviour)")
     args = ap.parse_args()
 
     self_name, self_labels = load_self()
-    people = collect(args.chats)
+    people = collect(args.chats, per_group=not args.merged)
     if not people:
         print(f"No parsed chats under {args.chats}. Run ingest/parse_export.py first.", file=sys.stderr)
         return 1
 
     targets = sorted(
-        ((n, d) for n, d in people.items()
+        (((chat, n), d) for (chat, n), d in people.items()
          if len(d["msgs"]) >= args.min_messages
-         and (not args.only or args.only.lower() in n.lower())),
+         and (not args.only or args.only.lower() in n.lower()
+              or args.only.lower() in chat.lower())),
         key=lambda kv: -len(kv[1]["msgs"]),
     )
     if not targets:
@@ -175,12 +186,14 @@ def main():
 
     man = T.Manifest()
     built = skipped = adopted = failed = 0
-    for name, d in targets:
-        dest = outdir / f"{slug(self_name or name) if name.strip().lower() in self_labels else slug(name)}.md"
+    for (chat, name), d in targets:
+        stem = slug(self_name or name) if name.strip().lower() in self_labels else slug(name)
+        dest = (outdir / chat / f"{stem}.md") if chat else (outdir / f"{stem}.md")
+        dest.parent.mkdir(parents=True, exist_ok=True)
         # Hash the messages that feed this card, not the file's mtime: re-parsing
         # the same export rewrites every month file, and mtime would then rebuild
         # the entire corpus on a run that changed nothing.
-        key = f"profile:{dest.stem}"
+        key = f"profile:{chat}/{dest.stem}" if chat else f"profile:{dest.stem}"
         ihash = T.content_hash(*(b for _, _, b in d["msgs"]))
         need, why = man.stale(key, ihash, count=len(d["msgs"]), min_delta=args.min_delta,
                               max_age_days=args.max_age_days, force=args.force)
@@ -192,7 +205,7 @@ def main():
             skipped += 1
             continue
         if args.dry_run:
-            print(f"  would build: {name} ({len(d['msgs'])} msgs, {len(d['chats'])} chats) — {why}")
+            print(f"  would build: {chat}/{name} ({len(d['msgs'])} msgs) — {why}")
             continue
         is_self = name.strip().lower() in self_labels
         tmpl = SELF_PROMPT if is_self else PROMPT
@@ -218,7 +231,7 @@ def main():
         dest.write_text(header + body + "\n", encoding="utf-8")
         man.record(key, ihash, count=len(d["msgs"]), model=args.model)
         built += 1
-        print(f"  {name} ({len(d['msgs'])} msgs, {why}) -> {dest}", file=sys.stderr)
+        print(f"  {chat}/{name} ({len(d['msgs'])} msgs, {why}) -> {dest}", file=sys.stderr)
 
     if not args.dry_run:
         man.save()
