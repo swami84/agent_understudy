@@ -11,13 +11,24 @@ import html, json, os, pathlib, re, shutil, subprocess, sys, tempfile, urllib.pa
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def _node_bin():
-    """Find a Node bin dir without pinning a version (nvm installs vary)."""
+    """Find the bin dir that actually holds `openclaw`, not merely one with node.
+
+    Resolving `node` is not enough: a distro node at /usr/bin satisfies that and
+    has no openclaw beside it, so the panel found a Node bin, put it on PATH, and
+    every config write failed with "[Errno 2] ... 'openclaw'". Under an
+    interactive shell nvm is already on PATH and the bug is invisible; under
+    systemd it is not.
+    """
     import glob, os, shutil
-    n = shutil.which("node")
-    if n:
-        return os.path.dirname(n)
+    oc = shutil.which("openclaw")
+    if oc:
+        return os.path.dirname(oc)
     cands = sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin")), reverse=True)
-    return cands[0] if cands else ""
+    for c in cands:
+        if os.path.exists(os.path.join(c, "openclaw")):
+            return c
+    n = shutil.which("node")
+    return os.path.dirname(n) if n else (cands[0] if cands else "")
 
 
 # Both overridable so the panel can be run against a fixture for screenshots
@@ -175,6 +186,7 @@ def state():
             "model": cfg.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", ""),
         },
         "groupPrompts": {k: (v.get("systemPrompt") or "") for k, v in groups_cfg.items()},
+        "announce": load_announce(),
         "schedules": cron_jobs(),
         "contextFiles": context_files(),
     }
@@ -219,13 +231,20 @@ def pattern_is_self_safe(pattern, name, prefix):
         f"{prefix} {name} is now set up and listening.",
         f"{prefix} I could not fetch that. Ask {name} again later.",
         f"{prefix} Noted.",
-        f"{name}: mentioning {name} again without the emoji",
+        f"{prefix} first line\nand {name} mentioned again lower down",
     ]
+    # A bare "<Name>: ..." with no emoji is deliberately NOT tested here. It is
+    # indistinguishable from a human typing the name with a colon, and treating
+    # it as the assistant's own output is what silently dropped a real summon.
+    # guard/gate.py normalizes the assistant's bare attribution to carry the
+    # emoji, so this sample can no longer occur — see normalize_attribution.
     for smp in samples:
         if rx.search(smp.lower()):
             return False, f"matches the assistant's own message: {smp[:52]!r}"
     for human in (f"{name} what is the score?", f"hey {name} check this",
-                  f'"{name}" what does this mean'):
+                  f'"{name}" what does this mean',
+                  f"{name}: who is coming tonight?",
+                  f"a first paragraph\n\nand then asking {name} something"):
         if not rx.search(human.lower()):
             return False, f"does not match a normal summon: {human[:40]!r}"
     return True, "ok"
@@ -303,7 +322,29 @@ def save_impersonation(m):
     IMP_STORE.write_text(json.dumps(m, indent=2))
 
 
-def identity_prompt(name, impersonate, emoji="🤖"):
+ANNOUNCE_STORE = ROOT / "config" / "announce.json"
+ANNOUNCE_DEFAULT = "\U0001f916 SwamAI: back online and listening. Summon me by name."
+
+
+def load_announce():
+    """{"enabled": {target: bool}, "message": str, "cooldownHours": int}"""
+    if ANNOUNCE_STORE.exists():
+        try:
+            d = json.loads(ANNOUNCE_STORE.read_text())
+            return {"enabled": d.get("enabled") or {},
+                    "message": d.get("message") or ANNOUNCE_DEFAULT,
+                    "cooldownHours": int(d.get("cooldownHours", 6))}
+        except Exception:
+            pass
+    return {"enabled": {}, "message": ANNOUNCE_DEFAULT, "cooldownHours": 6}
+
+
+def save_announce(a):
+    ANNOUNCE_STORE.parent.mkdir(parents=True, exist_ok=True)
+    ANNOUNCE_STORE.write_text(json.dumps(a, indent=2) + "\n")
+
+
+def identity_prompt(name, impersonate, emoji="\U0001f916"):
     """The managed instruction injected into a conversation's systemPrompt."""
     if impersonate:
         return (
@@ -538,6 +579,17 @@ class H(BaseHTTPRequestHandler):
                 imp["dms"] = {re.sub(r"\D", "", k): bool(v)
                               for k, v in (data["impersonateDms"] or {}).items() if re.sub(r"\D", "", k)}
 
+            if "announceMessage" in data or "announceCooldownHours" in data:
+                ann = load_announce()
+                if "announceMessage" in data:
+                    ann["message"] = (data.get("announceMessage") or "").strip() or ANNOUNCE_DEFAULT
+                if "announceCooldownHours" in data:
+                    try:
+                        ann["cooldownHours"] = max(0, min(168, int(data["announceCooldownHours"])))
+                    except (TypeError, ValueError):
+                        pass
+                save_announce(ann)
+
             pattern = mention_pattern_for(name)
             any_imp = any(imp["groups"].values()) or any(imp["dms"].values())
             # With any conversation impersonated the prefix comes off channel-wide,
@@ -605,6 +657,12 @@ class H(BaseHTTPRequestHandler):
             wa = cfg.setdefault("channels", {}).setdefault("whatsapp", {})
             g = wa.setdefault("groups", {}).setdefault(jid, {})
             g["requireMention"] = bool(data.get("requireMention", True))
+            if "announce" in data:
+                ann = load_announce()
+                ann["enabled"][jid] = bool(data.get("announce"))
+                if not ann["enabled"][jid]:
+                    ann["enabled"].pop(jid, None)
+                save_announce(ann)
             prompt = (data.get("systemPrompt") or "").strip()
             if prompt:
                 g["systemPrompt"] = prompt
@@ -785,7 +843,7 @@ button.ghost:hover{background:var(--panel-2);color:var(--ink)}
       <h3>Configure <span id=gcfgname></span></h3>
       <div class=muted id=gcfgid style=margin-bottom:12px></div>
 
-      <label class=row style="background:#132018;margin-bottom:10px">
+      <label class=row style="background:var(--panel-2);margin-bottom:10px">
         <input type=checkbox id=gRequireMention>
         <b>Only reply when summoned</b> — otherwise it answers every message in the group, including its own
       </label>
@@ -798,6 +856,17 @@ button.ghost:hover{background:var(--panel-2);color:var(--ink)}
             Off: messages carry the <code>🤖 Name:</code> marker.
             On: no marker, first person, in your voice — this group's members are not
             told a machine wrote it.
+          </div>
+        </div>
+      </label>
+
+      <label class=row style="background:var(--panel-2);margin-bottom:12px;align-items:flex-start">
+        <input type=checkbox id=gAnnounce style=margin-top:3px>
+        <div>
+          <b>Announce when SwamAI starts</b>
+          <div class=muted style=margin-top:3px>
+            Posts a short "back online" note here after a restart. Rate-limited so a
+            restart loop cannot repeat it; edit the wording in <b>Settings</b>.
           </div>
         </div>
       </label>
@@ -866,6 +935,12 @@ button.ghost:hover{background:var(--panel-2);color:var(--ink)}
       <div class=muted style=margin-bottom:6px>Leave empty to sign every DM. Per-group
         impersonation is set in <b>Groups → Configure</b>.</div>
       <textarea id=impersonateDms style=min-height:70px placeholder="15551234567"></textarea>
+
+      <label class=f>Startup announcement</label>
+      <div class=muted style=margin-bottom:6px>Sent to the conversations where it is enabled (Groups → Configure), after the gateway starts and the channel connects.</div>
+      <textarea id=announceMsg style=min-height:60px placeholder="🤖 SwamAI: back online and listening."></textarea>
+      <label class=f>Minimum hours between announcements</label>
+      <input id=announceCooldown type=number min=0 max=168 style=max-width:120px>
       <div class=muted id=impWarn style="margin-top:8px;color:#d29922"></div>
       <div class=bar style=border:0;margin-top:10px;padding-bottom:0>
         <button class=act onclick=saveIdentity()>Save identity</button>
@@ -916,6 +991,8 @@ async function load(){
   $('allowFrom').value=(s.allowFrom||[]).join('\n');
   $('dmPolicy').value=s.dmPolicy; $('groupPolicy').value=s.groupPolicy;
   $('mentionPatterns').value=(s.mentionPatterns||[]).join('\n');
+  $('announceMsg').value=(S.announce||{}).message||'';
+  $('announceCooldown').value=((S.announce||{}).cooldownHours??6);
   $('unmentionedInbound').value=s.unmentionedInbound;
   $('historyLimit').value=s.historyLimit;
   $('selfChatMode').checked=s.selfChatMode;
@@ -977,6 +1054,7 @@ function cfgGroup(jid){
   $('gprompt').value=S.groupPrompts[jid]||'';
   $('gRequireMention').checked=S.requireMention[jid]!==false;
   $('gImpersonate').checked=!!(S.settings.impersonateGroups||{})[jid];
+  $('gAnnounce').checked=!!((S.announce||{}).enabled||{})[jid];
   const sc=S.schedules[jid];
   $('schedOn').checked=!!sc;
   $('schedMsg').value=sc?.message||'';
@@ -1002,7 +1080,8 @@ async function saveGroupCfg(){
   if(!cfgJid)return;
   const rm=$('gRequireMention').checked;
   S.requireMention[cfgJid]=rm;
-  const r1=await post('/api/group',{jid:cfgJid,requireMention:rm,systemPrompt:$('gprompt').value});
+  const r1=await post('/api/group',{jid:cfgJid,requireMention:rm,systemPrompt:$('gprompt').value,
+                                   announce:$('gAnnounce').checked});
   if(!r1.ok)return flash($('msg4'),r1.message,false);
   const imp=$('gImpersonate').checked;
   if(imp && !(S.settings.impersonateGroups||{})[cfgJid] && !confirm(
@@ -1062,7 +1141,9 @@ async function saveIdentity(){
       'Those messages carry no marker and are written in your voice. Recipients are '+
       'not told an AI wrote them.')) return;
   const r=await post('/api/identity',{name,impersonateGroups:S.settings.impersonateGroups||{},
-                                      impersonateDms:dms});
+                                      impersonateDms:dms,
+                                      announceMessage:$('announceMsg').value,
+                                      announceCooldownHours:Number($('announceCooldown').value)});
   flash($('msg5'), r.ok ? (r.message+(r.warning?'  ⚠ '+r.warning:'')) : r.message, r.ok);
   if(r.ok){S=await (await fetch('/api/state')).json();$('responsePrefix').value=S.settings.responsePrefix||''}
 }

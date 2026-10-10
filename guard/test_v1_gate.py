@@ -183,7 +183,7 @@ def turn(body, chat_id="120363000000000000@g.us", stamp="[Fri 2026-10-09 10:18 E
 
 summoned = turn("SwamAI give top 10 contributors with message count.")
 quiet    = turn("Don’t know man. Making it safe for myself when he grows a conscience.")
-dm       = turn("Don’t know man.", chat_id="+19787959422")
+dm       = turn("Don’t know man.", chat_id="+15551234567")
 
 ck("the runtime block is not mistaken for the message",
    P.active_message_body(summoned).startswith("SwamAI give top 10"),
@@ -199,9 +199,20 @@ ck("a substring is not a summon",
    P.needs_summon(turn("that swamaiish thing")) is True)
 
 # Replying to the assistant quotes its message; that quote must not count.
+# A real reply puts the quote in its own block; the human's words are outside it.
 ck("a quoted bot reply is NOT a summon",
-   P.needs_summon(turn("\U0001f916 SwamAI: earlier answer here\nDon\u2019t know man, "
-                       "making it safe for myself")) is True)
+   P.needs_summon(turn("Don\u2019t know man, making it safe for myself\n\n"
+                       "[Replying to 19847194931333@lid id:AC15]\n"
+                       "\U0001f916 SwamAI: earlier answer mentioning SwamAI\n[/Replying]"))
+   is True)
+# Replying to the assistant prepends its attribution to the inbound body. That
+# artifact must NOT count as a summon, or every reply to it is self-sustaining.
+ck("the reply artifact alone is NOT a summon",
+   P.needs_summon(turn("\U0001f916 SwamAI: This is basically Anna in the corridor")) is True)
+ck("artifact plus a real summon still answers",
+   P.needs_summon(turn("\U0001f916 SwamAI: SwamAI sach mein gaya kya ye")) is False)
+ck("the name mid-sentence is still a summon",
+   P.needs_summon(turn("arre SwamAI kuch bol")) is False)
 ck("a human typing 'SwamAI:' IS a summon",
    P.needs_summon(turn("SwamAI: who is coming tonight?")) is False)
 ck("quote plus a real summon still answers",
@@ -232,6 +243,113 @@ ck("an explicit temperature is respected", caller["temperature"] == 0.1)
 compact_p = {"model": M, "messages": [
     {"role": "system", "content": "You are a context summarization assistant."}]}
 ck("compaction is still classed internal", P.is_internal_request(compact_p) is True)
+
+
+
+print("\nredelivered messages are answered once")
+P._SEEN.clear()
+P._ANSWERED.clear()
+RUNTIME_MID = ('<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\nConversation info: ⟦openclaw:ctx⟧\n'
+               '```json\n{"chat_id":"120363000000000000@g.us","message_id":"%s"}\n```\n'
+               '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>')
+
+
+def turn_mid(mid, body="SwamAI ping"):
+    return {"model": M, "tools": [{"type": "function"}] * 5, "messages": [
+        {"role": "system", "content": "<!-- openclaw:attempt:STABLE --> personal assistant "
+                                      "running inside OpenClaw"},
+        {"role": "user", "content": f"[Fri 2026-10-09 14:38 EDT] {body}"},
+        {"role": "user", "content": RUNTIME_MID % mid}]}
+
+t0 = 1000.0
+ck("first delivery is answered", P.already_answered(turn_mid("AAA"), t0) is False)
+ck("a tool round in the same turn is not a redelivery",
+   P.already_answered(turn_mid("AAA"), t0 + 30) is False)
+ck("still fine near the window edge",
+   P.already_answered(turn_mid("AAA"), t0 + P.TURN_WINDOW_SEC - 1) is False)
+# Suppression requires that a reply actually went out. A turn the gate blocked
+# must stay eligible, or redelivery — the user's last chance at an answer — dies.
+# An unanswered turn stays eligible, and checking it restarts its window —
+# so each case below re-seeds rather than sharing state.
+ck("an UNANSWERED message is not suppressed on redelivery",
+   P.already_answered(turn_mid("AAA"), t0 + 300) is False)
+
+P._SEEN.clear(); P._ANSWERED.clear()
+P.already_answered(turn_mid("BBB"), t0)          # first sight
+P._ANSWERED.add("BBB")                           # a reply went out
+ck("redelivery after the window is suppressed",
+   P.already_answered(turn_mid("BBB"), t0 + P.TURN_WINDOW_SEC + 1) is True)
+
+P._SEEN.clear(); P._ANSWERED.clear()
+P.already_answered(turn_mid("CCC"), t0)
+P._ANSWERED.add("CCC")
+ck("the 5-minute redelivery seen in the log is caught",
+   P.already_answered(turn_mid("CCC"), t0 + 300) is True)
+ck("a different message is unaffected",
+   P.already_answered(turn_mid("BBB"), t0 + 300) is False)
+ck("a retry prompt is machinery, not a new message",
+   P.is_internal_request({"model": M, "tools": [{"type": "function"}] * 5, "messages": [
+       {"role": "system", "content": "<!-- openclaw:attempt:STABLE --> personal assistant "
+                                     "running inside OpenClaw"},
+       {"role": "user", "content": "[Fri 2026-10-09 22:43 EDT] The previous attempt did "
+                                   "not produce a user-visible answer. Try again."}]}) is True)
+ck("no message_id means no suppression",
+   P.already_answered({"model": M, "messages": [
+       {"role": "user", "content": "[Fri 2026-10-09 14:38 EDT] SwamAI ping"}]}, t0) is False)
+P._SEEN.clear()
+
+
+
+print("\none summon, one send")
+P._SENDS.clear()
+
+
+def resp(*tool_names, content=None):
+    calls = [{"id": f"c{i}", "type": "function",
+              "function": {"name": n, "arguments": "{\"text\":\"hi\"}"}}
+             for i, n in enumerate(tool_names)]
+    msg = {"role": "assistant", "content": content}
+    if calls:
+        msg["tool_calls"] = calls
+    return {"model": M, "choices": [{"index": 0, "finish_reason":
+                                     "tool_calls" if calls else "stop", "message": msg}]}
+
+# The default is 0: the reply is itself a send, so allowing even one `message`
+# call means two WhatsApp messages for one summon.
+ck("default budget is 0 extra sends", P.MAX_SENDS_PER_TURN == 0)
+o = resp("message")
+ck("a proactive send is dropped by default", P.cap_sends(o, "MID0") is True)
+
+P.MAX_SENDS_PER_TURN = 1          # exercise the budget logic itself
+o = resp("message")
+ck("first message call passes at budget 1", P.cap_sends(o, "MID1") is False)
+ck("  and survives", len(o["choices"][0]["message"]["tool_calls"]) == 1)
+
+o2 = resp("message")
+ck("second call in the same turn is dropped", P.cap_sends(o2, "MID1") is True)
+m2 = o2["choices"][0]["message"]
+ck("  turn ends cleanly, not malformed",
+   m2.get("content") == "NO_REPLY" and "tool_calls" not in m2
+   and o2["choices"][0]["finish_reason"] == "stop")
+
+o3 = resp("message")
+ck("a different inbound message gets its own budget",
+   P.cap_sends(o3, "MID2") is False)
+
+P._SENDS.clear()
+o4 = resp("memory_search", "message", "web_fetch")
+P.cap_sends(o4, "MID3")
+o5 = resp("memory_search", "message", "web_fetch")
+ck("over budget, only the send is stripped", P.cap_sends(o5, "MID3") is True)
+kept = [c["function"]["name"] for c in o5["choices"][0]["message"]["tool_calls"]]
+ck("  other tools are untouched", kept == ["memory_search", "web_fetch"], str(kept))
+
+P._SENDS.clear()
+o6 = resp("memory_search")
+ck("non-send tools are never capped", P.cap_sends(o6, "MID4") is False)
+ck("no message_id means no capping", P.cap_sends(resp("message"), "") is False)
+P.MAX_SENDS_PER_TURN = 0
+P._SENDS.clear()
 
 print()
 if fails:

@@ -133,6 +133,14 @@ _INTERNAL_SYSTEM = (
     "do not continue the conversation",
     "produce a structured summary",
 )
+# Prompts OpenClaw sends to itself mid-turn. A retry after an empty reply is not
+# a new group message: it carries no summon word, so the summon guard suppressed
+# it and the retry budget was spent on nothing. Three consecutive messages went
+# unanswered this way.
+_INTERNAL_BODY = (
+    "the previous attempt did not produce a user-visible answer",
+    "previous attempt produced no visible reply",
+)
 # The persona marker a genuine reply request carries.
 _REPLY_SYSTEM = ("openclaw:attempt:", "personal assistant running inside openclaw")
 
@@ -154,6 +162,9 @@ def is_internal_request(payload):
     ).lower()
     if any(k in sys_text for k in _INTERNAL_SYSTEM):
         return True
+    body = _last_user_text(payload).lower()
+    if any(k in body for k in _INTERNAL_BODY):
+        return True
     # Reply rounds carry the agent's tool catalog; summarisation rounds carry none.
     if not (payload.get("tools") or []) and not any(k in sys_text for k in _REPLY_SYSTEM):
         return True
@@ -167,6 +178,8 @@ STAMP = re.compile(r"^\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{4}-\d{2}-\d{2})
 STALE_AFTER_MIN = int(os.environ.get("UNDERSTUDY_STALE_MIN", "30"))
 
 
+LEAD_ATTRIB = None
+QUOTED_BLOCK = re.compile(r"\[Replying to\b.*?\[/Replying\]", re.S | re.I)
 CTX_JSON = re.compile(r"\u27e6openclaw:ctx\u27e7\s*```json\s*(\{.*?\})\s*```", re.S)
 
 
@@ -270,6 +283,10 @@ def _summon_name():
         return ""
 
 
+def _lead_attrib(name):
+    return re.compile(rf"^\W{{1,4}}\s*{re.escape(name)}\s*:\s*", re.I)
+
+
 def needs_summon(payload):
     """True when this is a group message that never named the assistant.
 
@@ -286,6 +303,8 @@ def needs_summon(payload):
     name = _summon_name()
     if not name:
         return False
+    global LEAD_ATTRIB
+    LEAD_ATTRIB = _lead_attrib(name)
     ctx = openclaw_ctx(payload)
     chat_id = str(ctx.get("chat_id") or "")
     if not chat_id.endswith("@g.us"):
@@ -293,13 +312,116 @@ def needs_summon(payload):
     body = active_message_body(payload)
     if not body:
         return False                      # nothing parsed: do not suppress blindly
-    # Replying to the assistant quotes its own message, and that quote carries
-    # "<emoji> Name:". Left in, the quote would satisfy this check and a reply
-    # would still count as a summon — the exact case being fixed. Drop the
-    # assistant's attribution, using the same emoji rule as the mention pattern
-    # so a human typing "Name: ..." (no emoji) still counts.
-    body = re.sub(rf"\W{{1,4}}\s*{re.escape(name)}\s*:", " ", body, flags=re.I)
+    # A reply quotes the earlier message inside a [Replying to ...][/Replying]
+    # block. Drop that block so a quote cannot stand in for a summon.
+    #
+    # Do NOT strip the "<emoji> Name:" attribution from the rest: people address
+    # it in exactly that form, and stripping it deleted a real summon —
+    # "\U0001f916 SwamAI: What's the problem now ?" became "What's the problem
+    # now ?" and was suppressed as unsummoned.
+    body = QUOTED_BLOCK.sub(" ", body)
+    # Replying to one of the assistant's messages prepends its attribution to the
+    # inbound body: a reply reading "This is basically Anna in the corridor"
+    # arrives as "\U0001f916 SwamAI: This is basically Anna in the corridor".
+    # Counting that as a summon makes every reply to it self-sustaining. Strip it
+    # only at the START — a name used mid-sentence is a real summon.
+    body = LEAD_ATTRIB.sub("", body.lstrip(), count=1)
     return not re.search(rf"\b{re.escape(name)}\b", body, re.I)
+
+
+# How long one turn may keep calling the model about the same inbound message.
+# A turn legitimately makes several calls (tool rounds), so this cannot key on
+# "seen before" — it keys on "first seen longer ago than a turn can plausibly
+# run". 0 disables.
+TURN_WINDOW_SEC = int(os.environ.get("UNDERSTUDY_TURN_WINDOW", "240"))
+OBSERVE_TOOLS = os.environ.get("UNDERSTUDY_OBSERVE_TOOLS", "") == "1"
+_SEEN = {}
+_ANSWERED = set()
+
+
+def already_answered(payload, now=None):
+    """True when this inbound message was first seen more than a turn ago.
+
+    A turn that never completes gets retried, and WhatsApp redelivers what it
+    never saw acked. One message was delivered three times, five minutes apart,
+    and each delivery produced another reply. Nothing upstream deduplicates,
+    so the message_id is tracked here.
+    """
+    import time as _t
+    if TURN_WINDOW_SEC <= 0:
+        return False
+    mid = str(openclaw_ctx(payload).get("message_id") or "")
+    if not mid:
+        return False
+    now = now or _t.time()
+    first = _SEEN.get(mid)
+    if first is None:
+        if len(_SEEN) > 2000:                     # bound growth; oldest first
+            for k in sorted(_SEEN, key=_SEEN.get)[:1000]:
+                _SEEN.pop(k, None)
+        _SEEN[mid] = now
+        return False
+    # Only a message that actually produced a reply may be suppressed on
+    # redelivery. Marking it on first SIGHT meant a turn the gate blocked was
+    # recorded as handled, and WhatsApp's redelivery — the user's only remaining
+    # chance at an answer — was dropped too.
+    if mid not in _ANSWERED:
+        _SEEN[mid] = now                          # restart the turn window
+        return False
+    return (now - first) > TURN_WINDOW_SEC
+
+
+# How many `message` tool calls one inbound message may produce, ON TOP of the
+# reply. The reply is a separate send and always goes out, so 1 here means TWO
+# WhatsApp messages for one summon — which is exactly what was reported. 0 means
+# one summon, one reply. -1 disables the cap.
+MAX_SENDS_PER_TURN = int(os.environ.get("UNDERSTUDY_MAX_SENDS", "0"))
+_SENDS = {}
+SEND_TOOLS = {"message"}
+
+
+def cap_sends(obj, mid):
+    """Strip `message` tool calls past the per-turn budget. True if anything went.
+
+    OpenClaw executes the tool itself, so the send never passes through here —
+    but the model's REQUEST for it does, and that is where it can be refused.
+    One turn called `message` four times and sent four separate WhatsApp
+    messages for a single summon; nothing in OpenClaw caps that, and the
+    watchdog cannot see it because the sends are distinct and low-volume.
+    """
+    if MAX_SENDS_PER_TURN < 0 or not mid:
+        return False
+    stripped = False
+    for c in obj.get("choices") or []:
+        msg = c.get("message") or {}
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            continue
+        kept = []
+        for tc in calls:
+            name = ((tc.get("function") or {}).get("name") or "")
+            if name in SEND_TOOLS:
+                used = _SENDS.get(mid, 0)
+                if used >= MAX_SENDS_PER_TURN:
+                    stripped = True
+                    continue
+                _SENDS[mid] = used + 1
+            kept.append(tc)
+        if len(kept) != len(calls):
+            if kept:
+                msg["tool_calls"] = kept
+            else:
+                # Nothing left to call. End the turn cleanly rather than handing
+                # back an assistant message with neither content nor tool calls,
+                # which the agent loop would treat as a failure.
+                msg.pop("tool_calls", None)
+                msg["content"] = "NO_REPLY"
+                c["finish_reason"] = "stop"
+            c["message"] = msg
+    if len(_SENDS) > 2000:
+        for k in list(_SENDS)[:1000]:
+            _SENDS.pop(k, None)
+    return stripped
 
 
 def no_reply_response(model, stream):
@@ -383,7 +505,7 @@ def _strip_reasoning(obj):
     return changed
 
 
-def apply_gate_to_openai(raw, model=None, internal=False):
+def apply_gate_to_openai(raw, model=None, internal=False, turn_id=None):
     """Gate an OpenAI /v1/chat/completions response. Non-stream JSON or SSE.
 
     Same contract as the Ollama path: tool-call rounds are machinery and pass
@@ -408,7 +530,17 @@ def apply_gate_to_openai(raw, model=None, internal=False):
             return raw
         touched = _strip_reasoning(o)
         choices = o.get("choices") or []
-        if any((c.get("message") or {}).get("tool_calls") for c in choices):
+        calls = [tc for c in choices for tc in ((c.get("message") or {}).get("tool_calls") or [])]
+        if calls:
+            names = [((tc.get("function") or {}).get("name")) for tc in calls]
+            if OBSERVE_TOOLS:
+                print(f"tools requested: {names}", flush=True)
+            if turn_id:
+                _ANSWERED.add(turn_id)            # a tool round counts as progress
+            if cap_sends(o, turn_id):
+                print(f"send-cap: dropped extra message tool call(s) "
+                      f"(limit {MAX_SENDS_PER_TURN}/turn) from {names}", flush=True)
+                touched = True
             return json.dumps(o).encode() if touched else raw
         for c in choices:
             msg = c.get("message") or {}
@@ -432,6 +564,11 @@ def apply_gate_to_openai(raw, model=None, internal=False):
                 c["message"] = msg
                 touched = True
                 print(f"gate: {','.join(why)} -> {new[:48]!r}", flush=True)
+        if turn_id and any((c.get("message") or {}).get("content", "").strip()
+                           not in ("", "NO_REPLY") for c in choices):
+            _ANSWERED.add(turn_id)
+            if len(_ANSWERED) > 4000:
+                _ANSWERED.clear()
         return json.dumps(o).encode() if touched else raw
 
     # ---- streaming: SSE frames
@@ -491,6 +628,7 @@ class H(BaseHTTPRequestHandler):
         # Inject think=false for chat completions.
         req_model = req_format = None
         req_internal = req_stale = False
+        req_turn = None
         if method == "POST" and is_v1_chat and body:
             # Strata separates reasoning itself; there is nothing to inject here.
             # Read the model only so the gate can tell whose output this is.
@@ -499,8 +637,11 @@ class H(BaseHTTPRequestHandler):
                 if isinstance(payload, dict):
                     req_model = payload.get("model")
                     req_internal = is_internal_request(payload)
+                    req_turn = str(openclaw_ctx(payload).get("message_id") or "")
                     if not req_internal and is_stale(payload):
                         req_stale = "stale"
+                    elif not req_internal and already_answered(payload):
+                        req_stale = "redelivered"
                     elif not req_internal and needs_summon(payload):
                         req_stale = "unsummoned"
                     # Every /v1 request through this proxy is the assistant.
@@ -546,6 +687,9 @@ class H(BaseHTTPRequestHandler):
             if req_stale == "stale":
                 age = message_age_minutes(json.loads(body))
                 print(f"stale: {age:.0f} min old (> {STALE_AFTER_MIN}) -> NO_REPLY", flush=True)
+            elif req_stale == "redelivered":
+                mid = openclaw_ctx(json.loads(body)).get("message_id")
+                print(f"redelivered: message {mid} already handled -> NO_REPLY", flush=True)
             else:
                 snippet = active_message_body(json.loads(body))[:60]
                 print(f"unsummoned: group message without "
@@ -578,7 +722,7 @@ class H(BaseHTTPRequestHandler):
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 if is_chat:
-                    out = (apply_gate_to_openai(raw, req_model, req_internal) if is_v1_chat
+                    out = (apply_gate_to_openai(raw, req_model, req_internal, req_turn) if is_v1_chat
                            else apply_gate_to_body(raw, req_model, req_format))
                     self.wfile.write(b"%X\r\n%s\r\n" % (len(out), out))
                 else:

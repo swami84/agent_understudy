@@ -35,3 +35,7 @@ __pycache__/
 .venv/
 venv/
 node_modules/
+
+# Hindi profanity reference images used to seed the Ruby group persona.
+# Personal, not part of the public repo.
+docs/ruby_abuses/

@@ -53,7 +53,12 @@ def check(cfg: dict) -> list[tuple[str, str, str]]:
     wa = (cfg.get("channels") or {}).get("whatsapp") or {}
     groups_cfg = wa.get("groups") or {}
     allow = wa.get("groupAllowFrom") or []
-    group_jids = [x for x in allow if str(x).endswith("@g.us")]
+    # Union of both places a group can be declared. Deriving this from
+    # groupAllowFrom alone missed a group that was configured in `groups` with a
+    # systemPrompt and a requireMention flag but never added to the allowlist:
+    # fully set up in the UI, completely mute, and no check fired.
+    group_jids = sorted({x for x in allow if str(x).endswith("@g.us")}
+                        | {g for g in groups_cfg if str(g).endswith("@g.us")})
     senders = [re.sub(r"\D", "", str(x)) for x in allow if not str(x).endswith("@g.us")]
     gc = ((cfg.get("messages") or {}).get("groupChat")) or {}
     patterns = gc.get("mentionPatterns") or []
